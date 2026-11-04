@@ -1,21 +1,26 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 #include <torch/torch.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 
 #include <assert.h>
 #include <cstring>
 #include <memory>
+#include <limits>
 
 #include "gdr_context.hpp"
 #include "tensor_utils.hpp"
+#include "cuda_utils.h"
 
 using bf16 = __nv_bfloat16;
 using bf162 = __nv_bfloat162;
 
+#if KERNEL_USE_GDRCOPY == 1
 constexpr int MAX_GATHER_TOKENS = 1024 * 16;
 
 // Global GDR contexts for source pointers (shared with permute.cu pattern)
@@ -39,6 +44,7 @@ gdr_context_t get_gather_and_sum_src_ptrs_gdr() {
         return gather_and_sum_src_ptrs_gdr_alt;
     }
 }
+#endif
 
 // Fused gather and sum kernel
 // For each output token (sequence), gather topk tokens and sum them
@@ -56,64 +62,26 @@ __global__ void gather_and_sum_tokens_kernel(
     
     if (output_token_id >= n) return;
     
-    bf16 *out = reinterpret_cast<bf16 *>(d_out + output_token_id * hidden_size);
+    bf16 *out = reinterpret_cast<bf16 *>(d_out + int64_t(output_token_id) * hidden_size);
     int chunk_base = chunk_id * CHUNK_SIZE;
-    bf16 *out_chunk = out + chunk_base;
-    
-    constexpr int WARPSIZE = 32;
-    int num_warps = blockDim.x / WARPSIZE;
-    int tid = threadIdx.x;
-    int id_in_warp = tid % WARPSIZE;
-    int wid = tid / WARPSIZE;
-    
-    using VEC = float2;
-    constexpr int VEC_SIZE = sizeof(VEC) / sizeof(bf16);
-    
-    int task_per_warp = CHUNK_SIZE / num_warps / VEC_SIZE;
-    int warp_base = wid * task_per_warp;
-    
-    // Get pointer to first token for this output
     int first_token_idx = output_token_id * topk;
-    
-    // Initialize output with first token
-    bf16 *first_src = reinterpret_cast<bf16 *>(d_in_ptr[first_token_idx]);
-    VEC *first_src_vec = (VEC *)(first_src + chunk_base);
-    VEC *out_vec = (VEC *)(out_chunk);
-    
-    #pragma unroll
-    for (int i = id_in_warp; i < task_per_warp; i += WARPSIZE) {
-        out_vec[warp_base + i] = first_src_vec[warp_base + i];
-    }
-    
-    // Accumulate remaining topk-1 tokens
-    for (int k = 1; k < topk; k++) {
-        int token_idx = first_token_idx + k;
-        bf16 *src = reinterpret_cast<bf16 *>(d_in_ptr[token_idx]);
-        VEC *src_vec = (VEC *)(src + chunk_base);
-        
-        #pragma unroll
-        for (int i = id_in_warp; i < task_per_warp; i += WARPSIZE) {
-            VEC src_val = src_vec[warp_base + i];
-            VEC acc_val = out_vec[warp_base + i];
-            
-            // Use bf162 addition directly (each float in float2 contains 2 bf16 values as bf162)
-            bf162 *src_x = reinterpret_cast<bf162 *>(&src_val.x);
-            bf162 *src_y = reinterpret_cast<bf162 *>(&src_val.y);
-            bf162 *acc_x = reinterpret_cast<bf162 *>(&acc_val.x);
-            bf162 *acc_y = reinterpret_cast<bf162 *>(&acc_val.y);
-            
-            *acc_x = __hadd2(*src_x, *acc_x);
-            *acc_y = __hadd2(*src_y, *acc_y);
-            
-            out_vec[warp_base + i] = acc_val;
+    // Accumulate in FP32 and round once. Repeated BF16 additions lose small
+    // expert contributions, particularly with Top-8 routing. Scalar accesses
+    // also handle arbitrary row widths and unaligned tensor views safely.
+    for (int i = threadIdx.x; i < CHUNK_SIZE && chunk_base + i < hidden_size; i += blockDim.x) {
+        float sum = 0.0f;
+        for (int k = 0; k < topk; ++k) {
+            const bf16 *src = reinterpret_cast<const bf16 *>(d_in_ptr[first_token_idx + k]);
+            sum += __bfloat162float(src[chunk_base + i]);
         }
+        out[chunk_base + i] = __float2bfloat16(sum);
     }
 }
 
 #define LAUNCH_GATHER_AND_SUM_KERNEL_(SIZE) \
 do { \
     constexpr int chunk_size = (SIZE); \
-    dim3 grid(n, hidden_size / chunk_size, 1); \
+    dim3 grid(n, (int64_t(hidden_size) + chunk_size - 1) / chunk_size, 1); \
     gather_and_sum_tokens_kernel<T, chunk_size><<<grid, block, 0, stream>>>(dest, src_ptr, n, topk, hidden_size); \
 } while(0)
 
@@ -141,6 +109,7 @@ void _gather_and_sum_tokens_cuda(
     } else {
         LAUNCH_GATHER_AND_SUM_KERNEL_(128);
     }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 void gather_and_sum_tokens_cuda_dispatch(
     torch::Tensor dest, 
@@ -151,10 +120,23 @@ void gather_and_sum_tokens_cuda_dispatch(
 ) {
     // dest is a cuda ptr with shape [n, hidden_size]
     // src_ptr is a cpu ptr to array of n*topk uintptr_t pointers
+    TORCH_CHECK(dest.is_cuda() && dest.scalar_type() == at::kBFloat16, "dest must be a CUDA BFloat16 tensor");
+    TORCH_CHECK(dest.dim() == 2 && dest.is_contiguous(), "dest must be a contiguous 2D tensor");
+    TORCH_CHECK(n >= 0 && hidden_size > 0 && topk > 0 && dest.size(0) == n && dest.size(1) == hidden_size, "dest shape must match n and hidden_size, and topk must be positive");
+    TORCH_CHECK(n <= std::numeric_limits<int>::max() / topk && hidden_size <= std::numeric_limits<int>::max(), "token dimensions exceed kernel limits");
+    if (n == 0) return;
+    TORCH_CHECK(src_ptr != 0, "src_ptr must point to a host pointer array");
+    c10::cuda::CUDAGuard device_guard(dest.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamCaptureStatus capture_status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &capture_status));
+    TORCH_CHECK(capture_status == cudaStreamCaptureStatusNone,
+        "gather_and_sum_tokens uses a temporary host pointer array; call it outside CUDA graph capture");
     uintptr_t* src_ptr_host = reinterpret_cast<uintptr_t*>(src_ptr);
     using scalar_t = c10::BFloat16;
     
 #if KERNEL_USE_GDRCOPY == 1
+    TORCH_CHECK(n * topk <= MAX_GATHER_TOKENS, "gather pointer array exceeds GDR staging capacity");
     gdr_context_t gather_src_ptrs_gdr = get_gather_and_sum_src_ptrs_gdr();
     gather_src_ptrs_gdr->copy_from_host(src_ptr_host, n * topk * sizeof(uintptr_t));
     auto src_tensor = gather_src_ptrs_gdr->get_tensor();
@@ -167,13 +149,13 @@ void gather_and_sum_tokens_cuda_dispatch(
         hidden_size
     );
 #else
-    // Create a torch tensor and copy from host
-    auto src_tensor = torch::empty({n * topk}, torch::TensorOptions()
+    // Tensor::to retains the pinned allocation until its asynchronous H2D
+    // copy completes; the caller's temporary pointer vector is copied now.
+    auto host_tensor = torch::empty({n * topk}, torch::TensorOptions()
         .dtype(torch::kUInt64)
-        .device(torch::kCUDA));
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    CUDACHECK(cudaMemcpyAsync(src_tensor.data_ptr<uintptr_t>(), src_ptr_host, 
-               n * topk * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
+        .device(torch::kCPU).pinned_memory(true));
+    std::memcpy(host_tensor.data_ptr<uintptr_t>(), src_ptr_host, n * topk * sizeof(uintptr_t));
+    auto src_tensor = host_tensor.to(dest.options().dtype(torch::kUInt64), /*non_blocking=*/true);
     _gather_and_sum_tokens_cuda<scalar_t>(
         dest.data_ptr<scalar_t>(), 
         src_tensor.data_ptr<uintptr_t>(), 
@@ -185,6 +167,6 @@ void gather_and_sum_tokens_cuda_dispatch(
 }
 
 TORCH_LIBRARY_FRAGMENT(disag_ops, m) {
-    m.def("gather_and_sum_tokens(Tensor dest, int src_ptr, int n, int topk, int hidden_size) -> ()");
+    m.def("gather_and_sum_tokens(Tensor(a!) dest, int src_ptr, int n, int topk, int hidden_size) -> ()");
     m.impl("gather_and_sum_tokens", torch::kCUDA, gather_and_sum_tokens_cuda_dispatch);
 }

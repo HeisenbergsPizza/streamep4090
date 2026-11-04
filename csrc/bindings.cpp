@@ -39,6 +39,7 @@ PYBIND11_MODULE(disagmoe_c, m) {
     //     .def("terminate", &MuAttnDispatcher::terminate)
     //     .def("put", &MuAttnDispatcher::put, py::arg("TensorBatch"));
     py::class_<MuPool, std::shared_ptr<MuPool>>(m, "MuPool")
+        .def("terminate", &MuPool::terminate, py::call_guard<py::gil_scoped_release>())
         .def("put_batch", &MuPool::put_batch)
         .def("set_tracing_enabled", &MuPool::set_tracing_enabled)
         .def("drain_recv_completion_stats", &MuPool::drain_recv_completion_stats);
@@ -62,6 +63,7 @@ PYBIND11_MODULE(disagmoe_c, m) {
         .def_readwrite("pool_snapshot", &Scheduler::ScheduleTrace::pool_snapshot);
 
     py::class_<MuDispatcher, std::shared_ptr<MuDispatcher>>(m, "MuDispatcher")
+        .def("terminate", &MuDispatcher::terminate, py::call_guard<py::gil_scoped_release>())
         .def("put", &MuDispatcher::put)
         .def("set_max_pending_sends", &MuDispatcher::set_max_pending_sends)
         .def("set_tracing_enabled", &MuDispatcher::set_tracing_enabled)
@@ -160,14 +162,24 @@ PYBIND11_MODULE(disagmoe_c, m) {
         .def("prepare_seq_info", &BlockManager::prepare_seq_info)
         .def("prepare_seq_info_gdr", &BlockManager::prepare_seq_info_gdr);
 
+    m.def("gdrcopy_compiled", &GdrContext::gdrcopy_compiled);
+    m.def("gdrcopy_enabled", &GdrContext::gdrcopy_enabled);
     py::class_<GdrContext, std::shared_ptr<GdrContext>>(m, "GdrContext")
         .def(py::init<const torch::Tensor&>())
         .def("get_tensor", &GdrContext::get_tensor)
-        .def("copy_from_host", &GdrContext::copy_from_host)
-        .def("copy_from_host_tensor", &GdrContext::copy_from_host_tensor)
-        .def("copy_to_host", &GdrContext::copy_to_host)
-        .def("copy_to_host_tensor", &GdrContext::copy_to_host_tensor)
-        .def("fill", &GdrContext::fill)
+        .def("backend", &GdrContext::backend)
+        .def("copy_from_host", [](GdrContext& ctx, uintptr_t src, size_t nbytes, size_t offset) {
+            ctx.copy_from_host(reinterpret_cast<const void*>(src), nbytes, offset);
+        }, py::arg("src"), py::arg("nbytes"), py::arg("dst_offset") = 0)
+        .def("copy_from_host_tensor", &GdrContext::copy_from_host_tensor,
+             py::arg("src"), py::arg("nbytes") = 0)
+        .def("copy_to_host", [](GdrContext& ctx, uintptr_t dst, size_t nbytes, size_t offset) {
+            ctx.copy_to_host(reinterpret_cast<void*>(dst), nbytes, offset);
+        }, py::arg("dst"), py::arg("nbytes"), py::arg("src_offset") = 0)
+        .def("copy_to_host_tensor", &GdrContext::copy_to_host_tensor,
+             py::arg("dst"), py::arg("nbytes") = 0)
+        .def("fill", &GdrContext::fill,
+             py::arg("value"), py::arg("nbytes"), py::arg("dst_offset") = 0)
         .def("copy_from_host_int32", &GdrContext::copy_from_host_int32)
         .def("copy_from_host_int64", &GdrContext::copy_from_host_int64)
         .def("copy_from_host_float", &GdrContext::copy_from_host_float)
@@ -184,6 +196,8 @@ PYBIND11_MODULE(disagmoe_c, m) {
     m.def("recorder_create", &Recorder::create);
     m.def("range_push", &Recorder::push);
     m.def("range_pop", &Recorder::pop);
+    m.def("nvtx_enabled", &nvtx_enabled,
+          "Whether DMOE_ENABLE_NVTX=1 enables native NVTX ranges in this process.");
 
     py::class_<TraceContext>(m, "TraceContext")
         .def_readwrite("msg", &TraceContext::msg)

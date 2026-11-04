@@ -90,7 +90,7 @@ class Detokenizer:
                     t_prefill=cur_time_ms,
                     t_prefill_std=cur_time_ms,
                     t_decode=0.0,
-                    t_tokens=[]
+                    t_tokens=[cur_time_ms]
                 )
         
         self.step_infos.append(SamplerStepInfo(

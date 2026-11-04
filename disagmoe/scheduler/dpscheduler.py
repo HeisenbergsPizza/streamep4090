@@ -47,6 +47,7 @@ class DPScheduler:
     async def terminate(self):
         self.end_flag = True
         self.end_event.set()
+        self.sch_event.set()  # Also wake a request waiting for KV capacity.
         await self._loop_task
         self._log_task.cancel()
         try:
@@ -77,16 +78,16 @@ class DPScheduler:
                 return_when=asyncio.FIRST_COMPLETED
             )
             
-            if self.end_event.is_set():
-                self._logger.warning("Waiting loop terminated")
-                break
-            
             for f in pending:
                 f.cancel()
                 try:
                     await f
                 except asyncio.CancelledError:
                     pass
+
+            if self.end_event.is_set():
+                self._logger.warning("Waiting loop terminated")
+                break
             
             request_item: RequestItem = done.pop().result()
             rank = self.schedule([request_item.req_id], [request_item.prefill_len], [request_item.output_len])[0]
@@ -94,6 +95,8 @@ class DPScheduler:
             while rank < 0:
                 await self.sch_event.wait()
                 self.sch_event.clear()
+                if self.end_flag:
+                    return
                 rank = self.schedule([request_item.req_id], [request_item.prefill_len], [request_item.output_len])[0]
             
             # self._logger.warning(f"Waiting queue pop a request, assign {request_item.req_id} with rank {rank}, current waiting list size {self.waiting_queue.qsize()}")

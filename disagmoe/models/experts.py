@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import override, List, Optional, Dict
 from disagmoe.utils.constants import MAX_BATCH_SIZE
@@ -5,8 +6,11 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from disagmoe.models.linear import ReplicatedLinear
 from disagmoe.ops.quantization import sglang_per_token_group_quant_fp8
 from disagmoe.utils.logger import get_logger
+from disagmoe.utils.utils import nvtx_range
 
 import disagmoe_c
+
+_PROFILE_NVTX = os.environ.get("DMOE_ENABLE_NVTX", "0") == "1"
 
 # Optional import for deep_gemm (only available for sm90+)
 try:
@@ -90,16 +94,33 @@ class MoEExpertsCUTLASS(torch.nn.Module):
         )
 
         # Up projection: [tokens, hidden] @ [E, hidden, inter*2] -> [tokens, inter*2]
-        self.w13_runner.setup_meta(hiddens, cache_up, batch_sizes)
-        self.w13_runner.run()
-        up = (
-            self.act_fn(cache_up[:, : self.intermediate_size])
-            * cache_up[:, self.intermediate_size :]
-        )
+        if _PROFILE_NVTX:
+            with nvtx_range("MoE.CUTLASS.up"):
+                self.w13_runner.setup_meta(hiddens, cache_up, batch_sizes)
+                self.w13_runner.run()
+        else:
+            self.w13_runner.setup_meta(hiddens, cache_up, batch_sizes)
+            self.w13_runner.run()
+        if _PROFILE_NVTX:
+            with nvtx_range("MoE.CUTLASS.silu_gate"):
+                up = (
+                    self.act_fn(cache_up[:, : self.intermediate_size])
+                    * cache_up[:, self.intermediate_size :]
+                )
+        else:
+            up = (
+                self.act_fn(cache_up[:, : self.intermediate_size])
+                * cache_up[:, self.intermediate_size :]
+            )
 
         # Down projection: [tokens, inter] @ [E, inter, hidden] -> [tokens, hidden]
-        self.w2_runner.setup_meta(up, down_out, batch_sizes)
-        self.w2_runner.run()
+        if _PROFILE_NVTX:
+            with nvtx_range("MoE.CUTLASS.down"):
+                self.w2_runner.setup_meta(up, down_out, batch_sizes)
+                self.w2_runner.run()
+        else:
+            self.w2_runner.setup_meta(up, down_out, batch_sizes)
+            self.w2_runner.run()
         return down_out
 
 

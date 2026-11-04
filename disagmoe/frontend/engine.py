@@ -455,7 +455,9 @@ class ExpertEngineMixin:
             # Defer timing read — will be drained non-blockingly at next loop top
             self._pending_moe_events.append((batch.num_tokens, _evt_start, _evt_end))
         
-        topk_weights = batch.meta_c.topk_weights
+        # The kernel reads weights in the original expert-output row order.
+        # sort_by_attention also reorders the metadata's own weights.
+        topk_weights = list(batch.meta_c.topk_weights)
         new_mappings = list(batch.meta_c.sort_by_attention())
             
         if use_gdrcopy_optimization:
@@ -466,7 +468,7 @@ class ExpertEngineMixin:
             expert_weights_tensor = expert_weights_buffer_gdr.tensor
             expert_token_mapping_tensor = expert_token_mapping_buffer_gdr.tensor
         else:
-            topk_weights = torch.tensor(batch.meta_c.topk_weights, dtype=torch.float32, device="cuda")
+            topk_weights = torch.tensor(topk_weights, dtype=torch.float32, device="cuda")
             new_mappings = torch.tensor(new_mappings, dtype=torch.int32, device="cuda")
             expert_weights_tensor = topk_weights
             expert_token_mapping_tensor = new_mappings
@@ -523,9 +525,12 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         self.model_total_num_layers = 0
             
         self.loop_thread = None
+        self.loop_error = None
         
         self.profiler = None
         self.profile_dir = None
+        self._nsys_profile_active = False
+        self._nsys_markers_enabled = os.environ.get("DMOE_ENABLE_NVTX", "0") == "1"
         self.local_to_gloabl_expert_rank = []
         self.global_to_local_expert_rank = []
         self.device_group_ids = []
@@ -706,9 +711,45 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             self.dispatcher.set_max_pending_sends(self.engine_config.max_pending_sends)
         start_engine(self.scheduler, self.dispatcher)
         
-        self.loop_thread = Thread(target=self.single_module_loop_overlap)
+        self.loop_error = None
+        self.loop_thread = Thread(target=self._run_inference_loop)
             
         self.loop_thread.start()
+
+    def _run_inference_loop(self):
+        try:
+            self.single_module_loop_overlap()
+        except Exception:
+            import traceback
+            self.loop_error = traceback.format_exc()
+            self.end_flag = True
+            get_logger().error(self.loop_error)
+
+    def get_loop_error(self):
+        """Expose inference-thread failures to the controller's result poller."""
+        return self.loop_error
+
+    def start_nsys_profile(self):
+        """Open this actor's CUDA-profiler capture range after warmup."""
+        if not self._nsys_profile_active:
+            # Ray exposes one GPU to each actor; self.device is the actor's cuda:0.
+            with torch.cuda.device(self.device):
+                torch.cuda.profiler.start()
+            self._nsys_profile_active = True
+        return {
+            "pid": os.getpid(),
+            "device_id": self.device_id,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "cuda_device": str(self.device),
+        }
+
+    def stop_nsys_profile(self):
+        """Close this actor's capture range without adding a hot-path sync."""
+        if not self._nsys_profile_active:
+            return
+        with torch.cuda.device(self.device):
+            torch.cuda.profiler.stop()
+        self._nsys_profile_active = False
 
     def set_transport(self, name: str):
         import disagmoe_c as c
@@ -885,6 +926,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             assert False, "Invalid batch metadata"
             
     def recv_new_request(self):
+        if self.tokenizer_socket is None:
+            return
         try:
             new_request: TokenizedRequest = self.tokenizer_socket.recv_pyobj(zmq.NOBLOCK)
             meta = BatchMetadata(
@@ -982,6 +1025,7 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         _inf_had_batch = 0
         _inf_had_last = 0
         _inf_t_window = time.perf_counter()
+        _schedule_profile_count = 0
 
         try:
             while not self.end_flag:
@@ -991,7 +1035,15 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                 self._drain_transport_stats()
                 self.recv_new_request()
                 _sched_t0 = time.perf_counter()
-                batch, _trace_snapshot = self._schedule_batch_with_optional_trace()
+                # Most low-load polls are empty. Sample this Python range to
+                # bound trace volume; these durations are not a total cost.
+                if self._nsys_markers_enabled:
+                    _schedule_profile_count += 1
+                if self._nsys_markers_enabled and _schedule_profile_count % 64 == 0:
+                    with nvtx_range("Engine.schedule.sample_1_in_64"):
+                        batch, _trace_snapshot = self._schedule_batch_with_optional_trace()
+                else:
+                    batch, _trace_snapshot = self._schedule_batch_with_optional_trace()
                 forward_batch = None
                 if batch.data is not None:
                     _sched_ms = (time.perf_counter() - _sched_t0) * 1000.0
@@ -1010,9 +1062,17 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                         for _eid in set(meta.exp_ids):
                             self._advanced_logger.log_queuing_delay(_layer, _eid, _delay_ms, _sched_ts)
                     _proc_t0 = time.perf_counter()
-                    forward_batch = self.preprocess_batch(batch_wrapper)
+                    if self._nsys_markers_enabled:
+                        with nvtx_range("Engine.preprocess"):
+                            forward_batch = self.preprocess_batch(batch_wrapper)
+                    else:
+                        forward_batch = self.preprocess_batch(batch_wrapper)
                     if forward_batch is not None:
-                        result = forward_batch.proc_func(forward_batch)
+                        if self._nsys_markers_enabled:
+                            with nvtx_range("Engine.execute"):
+                                result = forward_batch.proc_func(forward_batch)
+                        else:
+                            result = forward_batch.proc_func(forward_batch)
                         result_queue.append((forward_batch, result))
                     self.step_profile(batch.metadata.num_tokens())
                     _inf_proc_ns += int((time.perf_counter() - _proc_t0) * 1e9)
@@ -1026,10 +1086,19 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                         pass
                     else:
                         if tmp_result.sync_event is not None:
-                            sync_event_timeout(tmp_result.sync_event)
+                            if self._nsys_markers_enabled:
+                                with nvtx_range("Engine.previous_event_wait"):
+                                    sync_event_timeout(tmp_result.sync_event)
+                            else:
+                                sync_event_timeout(tmp_result.sync_event)
                             tmp_result.sync_event = None
-                        final_result = tmp_batch.post_proc_func(tmp_batch, tmp_result)
-                        self.post_process(final_result, sync_event=tmp_result.sync_event)
+                        if self._nsys_markers_enabled:
+                            with nvtx_range("Engine.postprocess"):
+                                final_result = tmp_batch.post_proc_func(tmp_batch, tmp_result)
+                                self.post_process(final_result, sync_event=tmp_result.sync_event)
+                        else:
+                            final_result = tmp_batch.post_proc_func(tmp_batch, tmp_result)
+                            self.post_process(final_result, sync_event=tmp_result.sync_event)
                     _inf_had_last += 1
                 elif batch.data is None:
                     idle_conunt += 1
@@ -1175,6 +1244,17 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             self.buffer_meta[0] = -1
             torch.cuda.synchronize()
             dist.broadcast(self.buffer_meta, 0)
+
+        # The benchmark calls this after all requests complete. Stop Python
+        # producers before joining the now-idle native communication threads.
+        if self.loop_thread is not None:
+            self.loop_thread.join(timeout=10)
+            if self.loop_thread.is_alive():
+                raise RuntimeError("Inference thread did not stop within 10 seconds")
+        if self.dispatcher is not None:
+            self.dispatcher.terminate()
+        if self.pool is not None:
+            self.pool.terminate()
         
     def get_node_ip(self, host_ifname: str = "") -> str:
         return get_ip(host_ifname)

@@ -37,10 +37,23 @@ ZMQ_INCLUDE_PATH = os.path.join(ZMQ_HOME, "include")
 ZMQ_LIBRARY_PATH = os.path.join(ZMQ_HOME, "lib")
 TMPDIR=os.environ.get("TMPDIR", "/tmp/disagmoe/")
 
+def _env_bool(name, default):
+    value = os.environ.get(name, default).lower()
+    if value not in ("0", "1", "false", "true", "off", "on", "no", "yes"):
+        raise ValueError(f"{name} must be a boolean (0 or 1), got {value!r}")
+    return value in ("1", "true", "on", "yes")
+
+
+# ENABLE_GDRCOPY controls the build dependency. DMOE_USE_GDRCOPY controls
+# whether a GDR-enabled build uses BAR mappings at runtime. Keep USE_GDRCOPY
+# as a build-time alias for existing deployment environments.
+ENABLE_GDRCOPY = _env_bool("ENABLE_GDRCOPY", os.environ.get("USE_GDRCOPY", "1"))
 GDRCOPY_HOME = os.environ.get("GDRCOPY_HOME", "/usr/local/gdrcopy")
 GDRCOPY_INCLUDE_DIR = os.path.join(GDRCOPY_HOME, "include")
 GDRCOPY_LIBRARY_DIR = os.path.join(GDRCOPY_HOME, "lib")
-KERNEL_USE_GDRCOPY = os.environ.get("KERNEL_USE_GDRCOPY", "1")
+# This legacy flag selects reusable pointer-staging buffers in gather kernels.
+# GdrContext also supports CUDA copies, so it does not require ENABLE_GDRCOPY.
+KERNEL_USE_GDRCOPY = str(int(_env_bool("KERNEL_USE_GDRCOPY", "1")))
 D_ENABLE_HANG_DEBUGGER = os.environ.get("D_ENABLE_HANG_DEBUGGER", "0")
 
 def _detect_nixl_lib_dir():
@@ -118,7 +131,9 @@ THIRD_PARTY_INCLUDES = [
 ]
 
 ext_modules = [
-    cpp_extension.CppExtension(
+    # CUDAExtension supplies torch_cuda/c10_cuda/cudart linkage in addition to
+    # Torch's CPU libraries. The extension contains CUDA kernels and stream APIs.
+    cpp_extension.CUDAExtension(
         'disagmoe_c',
         find_all_c_targets(CSRC_DIR),
         include_dirs=[d for d in [
@@ -131,7 +146,7 @@ ext_modules = [
             *TORCH_INCLUDES,
             C_INCLUDE_PATH,
             CPP_INCLUDE_PATH,
-            GDRCOPY_INCLUDE_DIR,
+            GDRCOPY_INCLUDE_DIR if ENABLE_GDRCOPY else "",
             *extra_includes,
         ] if d],
         library_dirs=[d for d in [
@@ -141,12 +156,13 @@ ext_modules = [
             NCCL_LIBRARY_DIR,
             ZMQ_LIBRARY_PATH,
             LD_LIBRARY_PATH,
-            GDRCOPY_LIBRARY_DIR,
+            GDRCOPY_LIBRARY_DIR if ENABLE_GDRCOPY else "",
             "/usr/local/lib",
             "/usr/lib",
             *extra_libdirs,
         ] if d],
-        libraries=["cudart", "nccl", "zmq", "ucp", "ucs", "uct", "torch", "c10", "torch_cpu", "gdrapi", *extra_libs],
+        libraries=["nccl", "zmq", "ucp", "ucs", "uct",
+                   *(["gdrapi"] if ENABLE_GDRCOPY else []), *extra_libs],
         extra_compile_args=["-lstdc++", "-O2", "-w", "-std=c++17"],
         extra_link_args=extra_link_args,
         define_macros=[
@@ -155,6 +171,7 @@ ext_modules = [
             ("D_GROUP_NCCL_RECV", "0"),
             ("TEMP_DIR", f'"{TMPDIR}"'),
             ("KERNEL_USE_GDRCOPY", KERNEL_USE_GDRCOPY),
+            ("USE_GDRCOPY", str(int(ENABLE_GDRCOPY))),
             ("D_ENABLE_HANG_DEBUGGER", D_ENABLE_HANG_DEBUGGER),
             *extra_macros,
         ],

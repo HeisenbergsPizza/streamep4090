@@ -37,7 +37,7 @@ protected:
     std::vector<int> layer_ids;
 
     int device_id;
-    bool end_flag;
+    std::atomic<bool> end_flag;
 
     std::thread thread;
     std::vector<Channel_t> channels;
@@ -107,7 +107,12 @@ public:
 
     void put(TokenBatch batch, int rank = 0);
 
-    void set_max_pending_sends(int val) { max_pending_sends_ = val; }
+    void terminate() override;
+
+    void set_max_pending_sends(int val) {
+        TORCH_CHECK(val > 0, "max_pending_sends must be positive");
+        max_pending_sends_ = val;
+    }
 
     void set_tracing_enabled(bool v) { tracing_enabled_.store(v, std::memory_order_relaxed); } // [TRACING]
 

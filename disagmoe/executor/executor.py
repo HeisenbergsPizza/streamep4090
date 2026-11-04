@@ -33,6 +33,7 @@ from disagmoe.executor.cuda_graph import CUDAGraphAttnExecutor, CUDAGraphExperts
 from disagmoe.ops.cuda_graph import copy_graph_results_cuda
 from disagmoe.frontend.datatypes import BatchMetadata
 from disagmoe.utils.gdr_context import use_gdrcopy_optimization, GdrDoubleBuffer
+from disagmoe.utils.runtime_checks import kv_cache_block_budget
 
 def get_module_param_memory(module, unit='GB'):
     unit_scale = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}
@@ -97,9 +98,6 @@ class AttnExecutor(Executor):
         self.init_kv_cache()
         
     def init_model(self):
-        free_memory, total_memory = torch.cuda.mem_get_info()
-        self.init_gpu_memory = total_memory
-        
         # Build quantization config for attention QKV if requested
         qkv_quant_config = None
         try:
@@ -214,6 +212,8 @@ class AttnExecutor(Executor):
             get_logger().info(f"kv cache num_gpu_blocks: {self.cache_config.num_gpu_blocks}")
         else:
             self.num_cache_blocks = self.cache_config.num_gpu_blocks
+        if self.num_cache_blocks < 1:
+            raise ValueError("KV cache must contain at least one GPU block")
             
         self.kv_cache = MHATokenToKVPool(
             self.num_cache_blocks,
@@ -263,15 +263,23 @@ class AttnExecutor(Executor):
         
         free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
         
-        peak_memory = self.init_gpu_memory - free_gpu_memory
         cache_block_size = self.model_config.head_dim \
                             * self.model_config.num_kv_heads * self.cache_config.block_size * 2 * 2 # 2 for kv, 2 for fp16/bf16
-        
-        num_gpu_blocks = int(
-            (total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_memory) 
-            // cache_block_size // len(self.model_config.layer_ids)
+        block_bytes = cache_block_size * self.num_layers
+        num_gpu_blocks = kv_cache_block_budget(
+            total_gpu_memory, free_gpu_memory,
+            self.cache_config.gpu_memory_utilization, block_bytes,
         )
-        
+        override = self.cache_config.num_gpu_blocks_override
+        if override is not None:
+            if not 1 <= override <= num_gpu_blocks:
+                raise ValueError(f"num_gpu_blocks_override={override} exceeds the safe KV budget ({num_gpu_blocks}) or is not positive")
+            num_gpu_blocks = override
+        get_logger().info(
+            f"KV cache: {num_gpu_blocks} blocks, "
+            f"{num_gpu_blocks * block_bytes / 1024**3:.2f} GiB per GPU; "
+            f"{(total_gpu_memory - free_gpu_memory) / 1024**3:.2f} GiB already resident"
+        )
         return num_gpu_blocks
     
     def build_cuda_graph_executor(self):

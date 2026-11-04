@@ -1,14 +1,32 @@
-from disagmoe_c import GdrContext as GdrContextImpl
+"""Host metadata staging with an optional GDRCopy backend.
+
+Build with ENABLE_GDRCOPY=0 to omit gdrapi entirely. Set DMOE_USE_GDRCOPY=0
+before starting workers to use CUDA copies with either build. Copies complete
+on the tensor device's current stream before returning; they must run outside
+CUDA graph capture. Callers must order work on other streams themselves.
+"""
+
+from disagmoe_c import (
+    GdrContext as GdrContextImpl,
+    gdrcopy_compiled,
+    gdrcopy_enabled,
+)
 from disagmoe.utils.tensor_utils import get_cuda_aligned_tensor
 import torch
 
-use_gdrcopy_optimization = True
+# Runtime configuration is fixed before importing the engine in each worker.
+# Contexts remain usable when this is False, including existing C++ callers.
+use_gdrcopy_optimization = gdrcopy_enabled()
 
 class GdrContext:
     
     def __init__(self, tensor: torch.Tensor):
         self.gdr_context = GdrContextImpl(tensor)
         self.tensor = tensor
+
+    @property
+    def backend(self) -> str:
+        return self.gdr_context.backend()
         
     def copy_from_host(self, src: int, nbytes: int, dst_offset: int = 0) -> None:
         self.gdr_context.copy_from_host(src, nbytes, dst_offset)

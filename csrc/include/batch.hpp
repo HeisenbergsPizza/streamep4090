@@ -10,6 +10,8 @@
 #include "utils.hpp"
 
 #include <torch/torch.h>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAStream.h>
 #include <memory>
 
 // Lazy lookup of the custom CUDA op to avoid static initialization order issues.
@@ -27,6 +29,15 @@ inline auto& get_op_gather_and_sum_tokens() {
             .findSchemaOrThrow("disag_ops::gather_and_sum_tokens", "")
             .typed<void(torch::Tensor, long, long, long, long)>();
     return op;
+}
+
+// Gather kernels receive raw row pointers, so PyTorch cannot infer that source
+// storage is in use on the compute stream. Received tensors are often allocated
+// on a different stream and their last owner can disappear immediately after
+// merging. Keep their allocator blocks live until this stream finishes reading.
+inline void record_gather_source(const torch::Tensor& tensor) {
+    c10::cuda::CUDACachingAllocator::recordStream(
+        tensor.storage().data_ptr(), c10::cuda::getCurrentCUDAStream(tensor.get_device()));
 }
 
 struct TokenBatch: ScheduleUnit {
@@ -88,6 +99,7 @@ struct TokenBatch: ScheduleUnit {
         {
             tx_range _{"TensorBatch::merge::perpare_for_gather_cuda"};
             for (auto &batch: batches) {
+                record_gather_source(batch.data);
                 uintptr_t cur_ptr = (uintptr_t) batch.data.data_ptr();
                 for (int i = 0; i < batch.metadata->num_tokens(); i ++) {
                     srcs[mappings[idx]] = cur_ptr;
@@ -134,6 +146,7 @@ struct TokenBatch: ScheduleUnit {
         const int hidden_size_byte = merged_meta->token_hidden_dim() * merged_tokens.element_size();
 
         for (auto &batch: batches) {
+            record_gather_source(batch.data);
             uintptr_t cur_data_ptr = (uintptr_t) batch.data.data_ptr();
             int num_prefill_tokens = batch.metadata->num_prefill_tokens.value();
             int num_decode_tokens = batch.metadata->num_decode_tokens.value();
@@ -175,6 +188,7 @@ struct TokenBatch: ScheduleUnit {
     }
 
     inline static TokenBatch pack_topk_tokens(int layer_id, std::vector<TokenTopKInfo>& tokens) {
+        if (tokens.empty()) return TokenBatch {};
         std::sort(tokens.begin(), tokens.end(), 
             [](const TokenTopKInfo &a, const TokenTopKInfo &b) {
                 if (a.init_prefill_len == -1 || b.init_prefill_len == -1) {
@@ -186,6 +200,7 @@ struct TokenBatch: ScheduleUnit {
 
         int n = tokens.size();
         int topk = tokens[0].count();
+        TORCH_CHECK(topk > 0, "Top-k tokens must contain at least one expert output");
 
         auto meta = BatchMetadata::pack_topk_tokens(layer_id, tokens);
 
@@ -201,7 +216,9 @@ struct TokenBatch: ScheduleUnit {
         std::vector<uintptr_t> src_ptrs(n * topk);
 
         for (int i = 0; i < n; i++) {
+            TORCH_CHECK(tokens[i].count() == topk, "All tokens must have the same number of expert outputs");
             for (int k = 0; k < topk; k++) {
+                record_gather_source(tokens[i].topk_tensors[k]);
                 src_ptrs[i * topk + k] = (uintptr_t) tokens[i].topk_tensors[k].data_ptr();
             }
         }

@@ -11,6 +11,21 @@
 #include <stack>
 #include <ctime>
 #include <map>
+#include <cstdlib>
+#include <cstring>
+
+#include <nvtx3/nvToolsExt.h>
+
+// Independent of the legacy in-memory recorder. Set before importing the
+// extension; the cached value keeps range entry/exit balanced across threads.
+// NVTX v3 is header-only and emits nothing when no profiler is attached.
+inline bool nvtx_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("DMOE_ENABLE_NVTX");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 class Recorder;
 
@@ -104,15 +119,23 @@ public:
     }
 
     static void push(const std::string &msg) {
-        std::shared_lock lock(mtx);
-
-        instance->push_(msg);
+        if (instance->enabled) {
+            std::shared_lock lock(mtx);
+            instance->push_(msg);
+        }
+        if (nvtx_enabled()) {
+            nvtxRangePushA(msg.c_str());
+        }
     }
 
     static void pop() {
-        std::shared_lock lock(mtx);
-
-        instance->pop_();
+        if (nvtx_enabled()) {
+            nvtxRangePop();
+        }
+        if (instance->enabled) {
+            std::shared_lock lock(mtx);
+            instance->pop_();
+        }
     }
 
     static std::map<size_t, std::vector<TraceContext>> output() {

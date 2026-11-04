@@ -20,6 +20,8 @@ from disagmoe.utils.constants import *
 from disagmoe.scheduler import get_dp_scheduler, DPScheduler
 from disagmoe.config import CacheConfig, ModelConfig, EngineConfig
 from disagmoe.env import ENV_VARS
+from disagmoe.frontend.async_result import AsyncResult
+from disagmoe.utils.runtime_checks import validate_request_lengths
 _tokenizer_mod = importlib.import_module("disagmoe.frontend.tokenizer")
 Tokenizer = _tokenizer_mod.Tokenizer
 Detokenizer = _tokenizer_mod.Detokenizer
@@ -27,28 +29,6 @@ Detokenizer = _tokenizer_mod.Detokenizer
 from asyncio import Future
 
 from typing import List, Dict, Optional, Union, Tuple
-
-class AsyncResult:
-    
-    def __init__(self, req_id: int):
-        self.req_id = req_id
-        self.finish_cond = asyncio.Condition()
-        self.slo_stat = None
-        
-    async def wait(self):
-        async with self.finish_cond:
-            await self.finish_cond.wait()
-        
-    async def get(self) -> SloStat:
-        await self.wait()
-        assert self.slo_stat is not None
-        return self.slo_stat
-        
-    async def put(self, slo_stat: SloStat):
-        self.slo_stat = slo_stat
-        async with self.finish_cond:
-            self.finish_cond.notify()
-        
 
 class Controller:
     
@@ -76,6 +56,8 @@ class Controller:
         self.end_flag = False
         self.request_results: Dict[int, AsyncResult] = dict()
         self.is_polling = False
+        self._poll_error = None
+        self._max_cache_blocks = None
         self.enable_nsys = enable_nsys
         self.expert_wise_schedule = expert_wise_schedule
         self.host_ifname = host_ifname
@@ -125,7 +107,9 @@ class Controller:
             }
             
             if self.enable_nsys:
-                workers_env["nsight"] = "default"
+                from disagmoe.utils.nsys_profile import make_nsight_config
+                workers_env["nsight"] = make_nsight_config(
+                    cpu_sampling=os.environ.get("DMOE_NSYS_CPU_SAMPLING", "0") == "1")
             
             worker = ray.remote(
                 num_cpus=n_cpus,
@@ -395,14 +379,29 @@ class Controller:
         
     async def poll_finished_results(self) -> None:
         print(f"master start polling request")
-        while self.is_polling:
-            results = ray.get(self.detokenizer.fetch_finished_results.remote())
-            if len(results) != 0:
-                asyncio.create_task(self.process_finished_results(results))
-            try:
+        health_counter = 0
+        try:
+            while self.is_polling:
+                if health_counter % 10 == 0:
+                    errors = await asyncio.gather(*[
+                        worker.get_loop_error.remote() for worker in self.workers
+                    ])
+                    for device_id, error in zip(self.device_ids, errors):
+                        if error is not None:
+                            raise RuntimeError(f"Inference failed on device {device_id}:\n{error}")
+                health_counter += 1
+                results = await self.detokenizer.fetch_finished_results.remote()
+                if results:
+                    await self.process_finished_results(results)
                 await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                break
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            self._poll_error = error
+            self.is_polling = False
+            get_logger().error(f"Result polling failed: {error}")
+            for result in list(self.request_results.values()):
+                await result.fail(error)
     
     def start_polling_results(self):
         self.is_polling = True
@@ -419,6 +418,12 @@ class Controller:
             self._polling_task = None
             
     def put_single_request(self, input_len: int, output_len: int) -> AsyncResult:
+        if self._poll_error is not None:
+            raise RuntimeError("Inference service has failed") from self._poll_error
+        validate_request_lengths(
+            input_len, output_len, self.model_config.max_seq_len,
+            self.cache_config.block_size, self._max_cache_blocks,
+        )
         dp_scheduler = self.dp_scheduler
         assert dp_scheduler is not None
         req_id = self.get_new_req_id()
@@ -458,6 +463,15 @@ class Controller:
         tasks = [worker.terminate.remote() for worker in self.workers]
         ray.get(tasks)
         self.stop_profile()
+
+    def start_nsys_profile(self):
+        if self.enable_nsys:
+            self.nsys_workers = ray.get([
+                worker.start_nsys_profile.remote() for worker in self.workers])
+
+    def stop_nsys_profile(self):
+        if self.enable_nsys:
+            ray.get([worker.stop_nsys_profile.remote() for worker in self.workers])
         
     def init_profile(
         self, 
@@ -491,6 +505,7 @@ class Controller:
             if self.model_place.has_attn(device_id):
                 rank = self.model_place.attn_dp_rank_at(device_id)
                 stats[rank] = min(stats[rank], ray.get(worker.get_configured_kv_cache_blocks.remote()))
+        self._max_cache_blocks = max(stats.values())
         self.dp_scheduler.start(stats)
     
     async def stop_scheduler(self):

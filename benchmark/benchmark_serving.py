@@ -68,7 +68,7 @@ class BenchmarkMetrics:
 
     def write_to_file(self, args):
         filename = args.file
-        metrics = { k: int(v) for k, v in self.__dict__.items()}
+        metrics = dict(self.__dict__)
         try:
             import pandas as pd
             if not os.path.exists(filename):
@@ -274,7 +274,8 @@ def analyze_results(results: List[SloStat], duration: float):
     total_output_tokens = 0
     num_reqs = len(results)
     for result in results:
-        total_output_tokens += len(result.t_tokens)
+        # t_tokens contains N-1 intervals; timestamps contains N output tokens.
+        total_output_tokens += len(result.t_token_timestamps)
         itls.extend(result.t_tokens)
         req_latency.append(result.t_decode)
         
@@ -287,9 +288,9 @@ def analyze_results(results: List[SloStat], duration: float):
         req_latency_median_ms=np.median(req_latency) * 1000,
         req_latency_p99_ms=np.percentile(req_latency, 99) * 1000,
         
-        itl_latency_mean_ms=np.mean(itls) * 1000,
-        itl_latency_median_ms=np.median(itls) * 1000,
-        itl_latency_p99_ms=np.percentile(itls, 99) * 1000,
+        itl_latency_mean_ms=np.mean(itls) * 1000 if itls else -1,
+        itl_latency_median_ms=np.median(itls) * 1000 if itls else -1,
+        itl_latency_p99_ms=np.percentile(itls, 99) * 1000 if itls else -1,
     )
     
     return metrics
@@ -512,7 +513,7 @@ async def run_benchmark(master: Controller, args,
     tasks = []
     req_submit_timestamps = []
     req_finish_timestamps = []
-    logger.info(f"generating requests at rate {args.rate} s/req, in total {args.num_requests} requests")
+    logger.info(f"generating requests at rate {rate} req/s, in total {num_requests} requests")
     for i in range(num_requests):
         t_elapsed = time.perf_counter() - t_start
         arrival, input_len, output_len = workload[i]
@@ -598,11 +599,29 @@ async def benchmark_serving(
 
     # run benchmark
     logger.info("Now running benchmark.")
-    results, req_submit_timestamps, req_finish_timestamps, duration = await run_benchmark(
-        master, args, args.generator_type, args.num_requests,
-        args.min_input_len, args.max_input_len,
-        args.min_output_len, args.max_output_len,  args.rate
-    )
+    # Every GPU actor starts capture after warmup. No per-layer synchronization
+    # is introduced; capture ends after all benchmark responses have arrived.
+    nsys_enabled = getattr(args, "nsys", False)
+    try:
+        if nsys_enabled:
+            master.start_nsys_profile()
+        results, req_submit_timestamps, req_finish_timestamps, duration = await run_benchmark(
+            master, args, args.generator_type, args.num_requests,
+            args.min_input_len, args.max_input_len,
+            args.min_output_len, args.max_output_len,  args.rate
+        )
+    except BaseException:
+        # A failed capture start may have started only some workers. Try to
+        # stop all of them, preserving the original workload/start exception.
+        if nsys_enabled:
+            try:
+                master.stop_nsys_profile()
+            except Exception:
+                logger.exception("Could not stop Nsight capture after benchmark failure")
+        raise
+    else:
+        if nsys_enabled:
+            master.stop_nsys_profile()
     
     if not is_api_server:
         await master.stop_scheduler()

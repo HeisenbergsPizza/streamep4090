@@ -65,8 +65,10 @@ int MuHelper::get_device_id() {
 }
 
 void MuHelper::terminate() {
-    this->end_flag = true;
-    this->thread.join();
+    this->end_flag.store(true);
+    if (this->thread.joinable()) {
+        this->thread.join();
+    }
 #if defined(D_ENABLE_HANG_DEBUGGER) && D_ENABLE_HANG_DEBUGGER == 1
     HangDebugger::terminate();
 #endif
@@ -125,13 +127,13 @@ void MuDispatcher::drain_pending_sends_to(int max_pending) {
     double block_start_s = 0.0;
     int pending_before = 0;
     int yield_count = 0;
-    while ((int)this->pending_sends.size() >= max_pending) {
+    while ((int)this->pending_sends.size() >= max_pending && !this->end_flag.load()) {
         auto &pr = this->pending_sends.front();
         cudaError_t err = cudaEventQuery(pr.second);
         if (err == cudaSuccess) {
             CUDACHECK(cudaEventDestroy(pr.second));
             this->pending_sends.pop();
-        } else {
+        } else if (err == cudaErrorNotReady) {
             // [TRACING] record stall metadata only when tracing is on
             if (tracing && !blocked) {
                 blocked = true;
@@ -140,6 +142,8 @@ void MuDispatcher::drain_pending_sends_to(int max_pending) {
             }
             if (tracing) yield_count++;
             std::this_thread::yield();
+        } else {
+            CUDACHECK(err);
         }
     }
     // [TRACING] accumulate stall event
@@ -154,6 +158,7 @@ void MuDispatcher::send_batch_nonblocking(int cid, const TokenBatch &batch) {
     tx_range _{"MuDispatcher::send_batch_nonblocking"};
 
     this->drain_pending_sends_to(this->max_pending_sends_);
+    if (this->end_flag.load()) return;
 
     const bool tracing = this->tracing_enabled_.load(std::memory_order_relaxed);
     const int log_num_tokens = batch.metadata ? batch.metadata->num_tokens() : 0;
@@ -250,14 +255,15 @@ void MuDispatcher::run() {
     }
 
     // DMOE_LOG(DEBUG) << "running mudispatcher@" << this->device_id << LEND;
-    while (!this->end_flag) {
+    while (!this->end_flag.load()) {
         // DMOE_LOG(WARNING) << "waiting for new dispatching request ..." << LEND;
         this->clean_pending_sends();
         TokenBatch batch;
         {
             // Fetch a batch from the queue, lock required (for the send_queue).
             std::unique_lock<std::mutex> lock(this->mtx);
-            this->cv.wait(lock, [&] { return !this->send_queue.empty(); });
+            this->cv.wait(lock, [&] { return this->end_flag.load() || !this->send_queue.empty(); });
+            if (this->end_flag.load()) break;
             // DMOE_LOG(WARNING) << "Got a request !!!" << LEND;
             auto pr = this->send_queue.front();
             batch = pr.first;
@@ -266,6 +272,17 @@ void MuDispatcher::run() {
         // Send the batch, no lock required, since send_queue won't be changed.
         this->_send_once(batch);
     }
+}
+
+void MuDispatcher::terminate() {
+    // Protect the predicate change with the same mutex used by cv.wait, so
+    // stopping an idle dispatcher cannot lose its wakeup before joining.
+    {
+        std::lock_guard<std::mutex> lock(this->mtx);
+        this->end_flag.store(true);
+    }
+    this->cv.notify_all();
+    MuHelper::terminate();
 }
 
 void MuDispatcher::put(TokenBatch batch, int rank) {
@@ -605,7 +622,7 @@ void MuPool::run() {
     uint64_t pool_total_data_ready = 0;
     auto pool_stats_last = std::chrono::steady_clock::now();
 
-    while (!this->end_flag) {
+    while (!this->end_flag.load()) {
         ++pool_iter_count;
         bool _iter_had_work = false;
 #if USE_NIXL
@@ -665,19 +682,13 @@ void MuPool::run() {
         }
 #endif
 
-        bool should_block = pending_recvs.empty() && pending_metas_.empty();
-#if USE_NIXL
-        if (has_nixl) {
-            should_block = false;
-        }
-#endif
         int drain_count = 0;
-        bool got_anything = false;
 
         do {
             MetadataWithPeerId packed_data;
-            recv_metadata(packed_data, /*non_blocking=*/ !should_block);
-            should_block = false;
+            // A blocking metadata recv cannot observe terminate() when the
+            // request stream becomes idle. Poll and back off below instead.
+            recv_metadata(packed_data, /*non_blocking=*/ true);
 
             if (packed_data.peer_id < 0)
                 break;
@@ -736,6 +747,7 @@ void MuPool::run() {
         // 2. Poll pending NCCL recvs — process whichever completed
         for (auto it = pending_recvs.begin(); it != pending_recvs.end(); ) {
             if (cudaEventQuery(it->event) == cudaSuccess) {
+                _iter_had_work = true;
                 CUDACHECK(cudaEventDestroy(it->event));
                 // [TRACING] record NCCL recv completion
                 if (tracing) {
@@ -780,12 +792,14 @@ void MuPool::run() {
             pool_total_meta_recv += drain_count;
             _iter_had_work = true;
         }
-#if USE_NIXL
-        if (has_nixl && !_iter_had_work) {
-            std::this_thread::yield();
+        if (!_iter_had_work) {
+            if (!has_nixl && pending_recvs.empty() && pending_metas_.empty()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            } else {
+                std::this_thread::yield();
+            }
             ++pool_iter_slept;
         }
-#endif
         if (_iter_had_work) ++pool_iter_had_work;
 
         if (pool_iter_count % 100000 == 0) {

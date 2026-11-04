@@ -133,6 +133,14 @@ Scheduler::ScheduleTrace Scheduler::schedule_trace_attention() {
 
 TokenBatch Scheduler::schedule_unified() {
     int id = this->layer_scheduler->schedule();
+    // Idle polls are frequent; annotate only a selected nonempty layer.
+    // The Python caller samples the complete scheduling call separately.
+    if (id < 0) {
+        return unified_pool->get_batch_from_layer(id);
+    }
+    // Includes CPU batch preparation and asynchronous gather submission;
+    // GPU completion is measured separately by the CUDA activity trace.
+    tx_range dequeue{"Scheduler::dequeue_merge_unified"};
     return unified_pool->get_batch_from_layer(id);
 }
 

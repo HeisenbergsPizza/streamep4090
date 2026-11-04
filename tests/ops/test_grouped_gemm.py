@@ -5,20 +5,74 @@ import disagmoe_c
 torch.set_default_dtype(torch.bfloat16)
 
 
-def _ref_grouped_gemm(a, b, batch_sizes):
-    """Reference: per-expert torch.matmul."""
-    num_experts = b.size(0)
-    N = b.size(2)
-    outputs = []
-    offset = 0
-    for i in range(num_experts):
-        M = int(batch_sizes[i].item())
-        if M > 0:
-            ai = a[offset : offset + M]     # [M, K]
-            bi = b[i]                         # [K, N]
-            outputs.append(ai @ bi)           # [M, N]
-        offset += M
-    return torch.cat(outputs, dim=0) if outputs else torch.empty(0, N, device=a.device, dtype=a.dtype)
+def _ref_grouped_gemm(a, b, batch_sizes, *, allow_reduced_precision=False):
+    """Per-expert torch.matmul without BF16 intermediate reductions by default.
+
+    CUTLASS accumulates in FP32. BF16 intermediate reductions in the torch
+    reference can lose accuracy after SiLU/gating, especially near cancellation.
+    Scope this setting to reference GEMMs, including when called through pytest.
+    The opt-in path is only used for failure diagnostics.
+    """
+    old_reduction = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    try:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = allow_reduced_precision
+        num_experts = b.size(0)
+        N = b.size(2)
+        outputs = []
+        offset = 0
+        for i in range(num_experts):
+            M = int(batch_sizes[i].item())
+            if M > 0:
+                ai = a[offset : offset + M]     # [M, K]
+                bi = b[i]                      # [K, N]
+                outputs.append(ai @ bi)        # [M, N]
+            offset += M
+        return torch.cat(outputs, dim=0) if outputs else torch.empty(0, N, device=a.device, dtype=a.dtype)
+    finally:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = old_reduction
+
+
+def _comparison_summary(label, actual, expected):
+    """Report the original allclose criterion without relaxing its tolerances."""
+    a, b = actual.double(), expected.double()
+    diff = (a - b).abs()
+    limit = 0.1 + 0.1 * b.abs()
+    finite = torch.isfinite(a) & torch.isfinite(b)
+    bad = ~torch.isclose(actual, expected, atol=0.1, rtol=0.1)
+    score = torch.where(finite, diff / limit, torch.full_like(diff, float('inf')))
+    flat_index = int(score.reshape(-1).argmax().item())
+    row, col = divmod(flat_index, actual.size(1))
+    print(
+        f"{label}: mismatches={bad.sum().item()}/{bad.numel()}, "
+        f"nonfinite={(~finite).sum().item()}, max_abs={diff.max().item():.8g}, "
+        f"rms={diff.square().mean().sqrt().item():.8g}; "
+        f"worst tolerance ratio at [{row}, {col}]: "
+        f"actual={a[row, col].item():.8g}, expected={b[row, col].item():.8g}, "
+        f"abs_error={diff[row, col].item():.8g}, limit={limit[row, col].item():.8g}",
+        flush=True,
+    )
+
+
+def _assert_gemm_close(label, actual, expected, a, b, batch_sizes):
+    if torch.allclose(actual, expected, atol=0.1, rtol=0.1):
+        return
+    print(f"[FAIL] {label}; input dtype={a.dtype}, stride={a.stride()}, "
+          f"contiguous={a.is_contiguous()}", flush=True)
+    _comparison_summary("CUTLASS vs torch reference (BF16 reduced reduction disabled)", actual, expected)
+
+    # Compare the SAME input/weights to an independent, higher precision GEMM.
+    # Round once to the BF16 output format; this is diagnostic, not a new gate.
+    ref64 = _ref_grouped_gemm(a.double(), b.double(), batch_sizes)
+    rounded64 = ref64.to(actual.dtype)
+    _comparison_summary("CUTLASS vs FP64 rounded to BF16", actual, rounded64)
+    _comparison_summary("Torch reference vs FP64 rounded to BF16", expected, rounded64)
+
+    reduced_ref = _ref_grouped_gemm(a, b, batch_sizes, allow_reduced_precision=True)
+    _comparison_summary("CUTLASS vs torch with BF16 reduced reduction enabled",
+                        actual, reduced_ref)
+    _comparison_summary("Torch with BF16 reduced reduction enabled vs FP64 rounded to BF16",
+                        reduced_ref, rounded64)
+    raise AssertionError(f"{label}: atol=0.1, rtol=0.1 comparison failed; see diagnostics above")
 
 
 def test_basic():
@@ -87,7 +141,9 @@ def test_moe_pattern():
     w13_runner.setup_meta(hiddens, cache_up, batch_sizes)
     w13_runner.run()
     ref_up = _ref_grouped_gemm(hiddens, w13, batch_sizes)
-    assert torch.allclose(cache_up, ref_up, atol=1e-1, rtol=1e-1)
+    _assert_gemm_close("MoE up", cache_up, ref_up, hiddens, w13, batch_sizes)
+    # SiLU below modifies cache_up in place; save this statistic first.
+    up_diff = (cache_up.float() - ref_up.float()).abs().max().item()
 
     # SiLU + gate
     act = torch.nn.SiLU(inplace=True)
@@ -97,9 +153,9 @@ def test_moe_pattern():
     w2_runner.setup_meta(up, cache_down, batch_sizes)
     w2_runner.run()
     ref_down = _ref_grouped_gemm(up, w2, batch_sizes)
-    assert torch.allclose(cache_down, ref_down, atol=1e-1, rtol=1e-1)
+    _assert_gemm_close("MoE down", cache_down, ref_down, up, w2, batch_sizes)
 
-    print(f"[PASS] test_moe_pattern  (up diff = {(cache_up - ref_up).abs().max().item():.6f}, "
+    print(f"[PASS] test_moe_pattern  (up diff = {up_diff:.6f}, "
           f"down diff = {(cache_down - ref_down).abs().max().item():.6f})")
 
 
@@ -248,8 +304,8 @@ def test_moe_pattern_cuda_graph():
     torch.cuda.synchronize()
 
     ref_up = _ref_grouped_gemm(static_hiddens, w13, static_bs)
-    assert torch.allclose(static_up_out, ref_up, atol=1e-1, rtol=1e-1), \
-        f"w13 max diff: {(static_up_out - ref_up).abs().max().item()}"
+    _assert_gemm_close("MoE graph up", static_up_out, ref_up, static_hiddens, w13, static_bs)
+    up_diff = (static_up_out.float() - ref_up.float()).abs().max().item()
 
     # Activation (eager, between graphs)
     up = act(static_up_out[:, :inter]) * static_up_out[:, inter:]
@@ -272,15 +328,27 @@ def test_moe_pattern_cuda_graph():
     torch.cuda.synchronize()
 
     ref_down = _ref_grouped_gemm(static_up_input, w2, static_bs)
-    assert torch.allclose(static_down_out, ref_down, atol=1e-1, rtol=1e-1), \
-        f"w2 max diff: {(static_down_out - ref_down).abs().max().item()}"
+    _assert_gemm_close("MoE graph down", static_down_out, ref_down, static_up_input, w2, static_bs)
 
     print(f"[PASS] test_moe_pattern_cuda_graph  "
-          f"(w13 diff = {(static_up_out - ref_up).abs().max().item():.6f}, "
+          f"(w13 diff = {up_diff:.6f}, "
           f"w2 diff = {(static_down_out - ref_down).abs().max().item():.6f})")
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-bf16-reduced-precision", action="store_true",
+                        help="Also disable BF16 reduced reduction for the process; references already disable it locally")
+    args = parser.parse_args()
+    torch.manual_seed(args.seed)
+    if args.no_bf16_reduced_precision:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    print(f"Seed: {args.seed}; torch={torch.__version__}; "
+          "reference BF16 reduced precision reduction=False (scoped); "
+          f"process setting={torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction}")
     dev = torch.cuda.current_device()
     cap = torch.cuda.get_device_capability(dev)
     print(f"Device: {torch.cuda.get_device_name(dev)}, SM {cap[0]}{cap[1]}")
