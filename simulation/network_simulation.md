@@ -1,78 +1,56 @@
-# Bandwidth & Congestion-Aware Network Simulation
+# Simulation network contract
 
-## Overview
-
-The simulation models network transfer delays between GPUs using a **dual receive-queue** congestion model. Each GPU maintains two independent FIFO receive queues:
-
-1. **NVLink queue** — for intra-node (same-host) transfers
-2. **RDMA queue** — for inter-node (cross-host) transfers
-
-Each queue processes one transfer at a time at the full link bandwidth. The two queues operate independently and can drain in parallel.
-
-## Why Two Queues?
-
-In real GPU clusters, intra-node traffic (NVLink) and inter-node traffic (InfiniBand/RoCE RDMA) use physically separate network fabrics. A GPU receiving data from both a local peer (NVLink) and a remote peer (RDMA) does not contend on a shared link — the two paths are independent. However, two intra-node senders targeting the same GPU do share NVLink bandwidth, and two inter-node senders share the NIC.
-
-## Congestion Model
-
-### Receiver-Side Only
-
-We model congestion only on the **receiver side**. Sender-side contention is not modeled — this is a deliberate simplification. In practice, senders rarely saturate their outgoing links because traffic fans out to many destinations.
-
-### Transfer Time Computation
-
-Given a transfer of `num_tokens` from GPU `src` to GPU `dst`:
+The simulators model transfer completion events and queueing, not NCCL execution.
+The CPU runner (`python -m simulation.run`) defaults to one logical host. It
+accepts an assumed per-receiver bandwidth in **Gb/s** and startup latency in us:
 
 ```
-data_bytes = num_tokens × hidden_dim × bytes_per_element
-bandwidth  = NVLink_BW  if same_host(src, dst)  else  RDMA_BW
-solo_delay = data_bytes / bandwidth   (converted to simulation ticks)
+bytes = expert_token_copies * hidden_dim * bytes_per_element
+seconds = latency_us / 1e6 + bytes / (bandwidth_gbps * 1e9 / 8)
 ```
 
-`solo_delay` is the time the transfer takes when it has the full link to itself.
+These parameters are assumptions until calibrated on the target machine. A100
+or H100 names in a compute-profile filename do not calibrate the network.
 
-### Queueing Behavior
+## Local transfers and receive resources
 
-When multiple transfers arrive at the same GPU on the same link type, they are serialized in FIFO order. Each transfer occupies the channel for its full `solo_delay`. The total receive time on one channel is the sum of all queued transfer times.
+Same-GPU transfers cost zero and do not acquire a network resource. For remote
+transfers, `gpu // n_gpu_per_host` identifies the host. Each receiving GPU has
+one intra-host FIFO and one inter-host FIFO. Transfers on one FIFO serialize;
+different destinations or different channel types may run concurrently. This
+is an explicit resource model, not a claim about all physical NVLink/NVSwitch
+and RDMA topologies. Sender ports, switch contention, control-plane overhead,
+and compute/communication interference are not modeled.
 
-Because the NVLink and RDMA queues are independent, the GPU finishes receiving when the slower queue drains:
+The transfer unit counts routed **expert copies**, including multiple experts
+on the same destination. Dispatch groups one attention batch by destination;
+return groups one expert batch by the originating attention GPU. No assumed
+cross-expert payload deduplication is applied.
 
-```
-gpu_receive_time = max(sum_of_nvlink_transfers, sum_of_rdma_transfers)
-```
+## Execution models
 
-### Phase-Level Timing (sync / tbo simulators)
+- Async: dispatch and return share each destination's two receive FIFOs. Each
+  destination releases its own tokens immediately on completion. Expert compute
+  releases the compute resource before launching return traffic; the next
+  compute may overlap with that return. The next attention stage requires all
+  of a token's Top-k results. A local transfer still follows event ordering.
+- Sync: all transfers in each dispatch/return phase are aggregated by receiver
+  and channel, and the phase waits for the slowest receiver. There is a global
+  stage boundary.
+- TBO: both microbatches and both communication directions share receiver/channel
+  availability throughout the iteration. Compute waits for that microbatch's
+  preceding transfer. Final token completion includes the final return; the next
+  iteration begins after both microbatches finish. Compute remains the existing
+  single centralized resource abstraction.
 
-In the synchronous and TBO (two-batch overlap) simulators, all tokens in an iteration (or microbatch) go through each phase together. The phase cannot advance until every GPU finishes its receives. So the overall phase transfer time is:
+With no `net_delay_fn`, the Python APIs use fixed remote dispatch/return delays
+without receive contention. Local delay remains zero in all three models.
 
-```
-phase_transfer_time = max over all destination GPUs of gpu_receive_time
-```
+## Legacy experiment driver
 
-### Async Simulator
-
-In the async (simpy-based) simulator, each GPU's `IngressPort` has two `simpy.Resource(capacity=1)` objects — one for NVLink and one for RDMA. A transfer request acquires the appropriate resource (blocking if another transfer is in progress on that channel), holds it for `solo_delay` ticks, then releases it. This naturally serializes same-channel transfers while allowing NVLink and RDMA to proceed in parallel.
-
-## Topology
-
-GPU-to-host assignment is determined by `n_gpu_per_host`:
-
-```
-host_of(gpu) = gpu // n_gpu_per_host
-same_host(a, b) = (a // n_gpu_per_host) == (b // n_gpu_per_host)
-```
-
-## Parameters
-
-| Parameter | Description |
-|---|---|
-| `n_gpu_per_host` | Number of GPUs per physical host |
-| `hidden_dim` | Model hidden dimension (determines bytes per token) |
-| `bytes_per_element` | 2 for FP16, 4 for FP32 |
-| `intra_node_bw_gbps` | NVLink bandwidth in GB/s (e.g. 800) |
-| `inter_node_bw_gbps` | RDMA bandwidth in GB/s (e.g. 100 or 200) |
-| `net_delay_fn(src, dst, num_tokens)` | Returns transfer time in ticks for full bandwidth |
-
-## Fallback
-
-When `net_delay_fn` is `None` (bandwidth-aware mode disabled), fixed per-hop delays (`net_t_attn_to_expert`, `net_t_expert_to_attn`) are used instead, with no congestion modeling.
+`experiment.py` retains a beta-only bytes/bandwidth network model when bandwidth
+mode is enabled: the two fixed-delay configuration columns are then unused.
+When bandwidth mode is disabled, both same-host and cross-host remote traffic
+use its fixed `net_delay_inter_host`; `net_delay_intra_host` is not used by that
+legacy path. The new runner exposes the actual single-host bandwidth and startup
+latency directly. See [README.md](README.md) for commands and metric definitions.

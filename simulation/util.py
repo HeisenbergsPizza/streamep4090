@@ -1,8 +1,12 @@
 import os
 import csv
+import math
 from typing import Dict, List, Optional, Sequence
 
-from disagmoe.models.gate import ProfileDrivenRouter
+if __package__:
+    from .router import ProfileDrivenRouter
+else:  # direct invocation from simulation/
+    from router import ProfileDrivenRouter
 
 
 def expert_compute_time_lookup_table_from_profile(
@@ -32,6 +36,10 @@ def expert_compute_time_lookup_table_from_profile(
         FileNotFoundError: If csv_path does not exist.
         ValueError: If required headers are missing or coverage is incomplete.
     """
+    if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int) or max_batch_size < 1:
+        raise ValueError("max_batch_size must be a positive integer")
+    if not math.isfinite(ticks_per_millisecond) or ticks_per_millisecond <= 0:
+        raise ValueError("ticks_per_millisecond must be finite and positive")
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"Expert compute profile not found: {csv_path}")
 
@@ -46,6 +54,9 @@ def expert_compute_time_lookup_table_from_profile(
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         headers = [h.strip() for h in (reader.fieldnames or [])]
+        reader.fieldnames = headers
+        if len(set(headers)) != len(headers):
+            raise ValueError(f"Duplicate columns in expert profile {csv_path}")
 
         size_key: Optional[str] = next((h for h in size_headers if h in headers), None)
         time_key: Optional[str] = next((h for h in time_headers if h in headers), None)
@@ -56,14 +67,17 @@ def expert_compute_time_lookup_table_from_profile(
                 f"size in {size_headers}, time in {time_headers}"
             )
 
-        for row in reader:
+        for line_number, row in enumerate(reader, 2):
             try:
                 bs = int(row[size_key])
                 t = float(row[time_key]) * ticks_per_millisecond
-                lookup[bs] = t
-            except Exception:
-                # Skip malformed rows
-                continue
+            except (ValueError, TypeError, KeyError) as exc:
+                raise ValueError(f"Malformed expert profile row {line_number} in {csv_path}") from exc
+            if bs < 1 or not math.isfinite(t) or t <= 0:
+                raise ValueError(f"Expert profile row {line_number} requires positive batch size and finite positive time")
+            if bs in lookup:
+                raise ValueError(f"Duplicate batch size {bs} in expert profile {csv_path}")
+            lookup[bs] = t
 
     # Validate coverage for 1..max_batch_size inclusive
     missing: List[int] = [s for s in range(1, max_batch_size + 1) if s not in lookup]

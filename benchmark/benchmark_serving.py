@@ -175,6 +175,8 @@ def resolve_expert_allocation(
     return expert_allocation, attn_dp_weights, per_device_config
 
 def launch(args):
+    from disagmoe.utils.synchronized_start import validate_configuration
+    validate_configuration(args)
     # Select transport in C++ backend (default from CLI is zmq)
     c.select_transport(args.transport)
     cluster_config = ClusterConfig(n_node=args.num_nodes, n_gpu=args.num_gpus)
@@ -538,6 +540,29 @@ async def run_benchmark(master: Controller, args,
 
     return results, req_submit_timestamps, req_finish_timestamps, t_duration
 
+async def run_synchronized_benchmark(master: Controller, args, responses):
+    """Release the prepared cohort once; subsequent execution uses normal scheduling."""
+    pbar = tqdm.tqdm(total=len(responses))
+    finished = []
+    tasks = [asyncio.create_task(process_response(response, finished, pbar))
+             for response in responses]
+    try:
+        # Called only after all batches are ready and all requested profilers
+        # have started. Use the same perf_counter clock as process_response.
+        release_ns = await master.release_synchronized_start()
+        started = release_ns / 1e9
+        results = await asyncio.gather(*tasks)
+        duration = time.perf_counter() - started
+        await master.finish_synchronized_start()
+        return results, [0.0] * len(responses), sorted(t - started for t in finished), duration
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        pbar.close()
+
+
 async def benchmark_warmup(master: Controller, args):
     logger.info("Now running warmup ...")
     _num_warmup_requests = 10
@@ -579,6 +604,13 @@ def post_benchmark(master, args, results, req_submit_timestamps, req_finish_time
         logger.info(f"Advanced logs dumped to {_adv_dir}")
          
     metrics.write_to_file(args)
+    if getattr(args, "synchronized_start", False):
+        report = master.synchronized_start_report
+        filename = os.fspath(args.file) + ".synchronized-start.json"
+        with open(filename, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        logger.info(f"Synchronized start: initial batch={report['initial_batch_per_rank']} per GPU, "
+                    f"CPU execute-start skew={report['cpu_start_skew_ms']:.3f} ms; report: {filename}")
     logger.info("Results written to file.")
     return metrics
 
@@ -588,6 +620,12 @@ async def benchmark_serving(
     is_api_server: bool = False
 ):
     assert master is not None, "master is not initialized"
+    synchronized_start = getattr(args, "synchronized_start", False)
+    if synchronized_start:
+        from disagmoe.utils.synchronized_start import validate_configuration
+        validate_configuration(args)
+        if is_api_server:
+            raise ValueError("Synchronized start requires a dedicated benchmark launch")
     
     if not is_api_server:
         master.start_polling_results()
@@ -603,14 +641,26 @@ async def benchmark_serving(
     # is introduced; capture ends after all benchmark responses have arrived.
     nsys_enabled = getattr(args, "nsys", False)
     try:
+        if synchronized_start:
+            responses = await master.prepare_synchronized_start(
+                args.num_requests, args.min_input_len, args.min_output_len)
         if nsys_enabled:
             master.start_nsys_profile()
-        results, req_submit_timestamps, req_finish_timestamps, duration = await run_benchmark(
-            master, args, args.generator_type, args.num_requests,
-            args.min_input_len, args.max_input_len,
-            args.min_output_len, args.max_output_len,  args.rate
-        )
+        if synchronized_start:
+            results, req_submit_timestamps, req_finish_timestamps, duration = await run_synchronized_benchmark(
+                master, args, responses)
+        else:
+            results, req_submit_timestamps, req_finish_timestamps, duration = await run_benchmark(
+                master, args, args.generator_type, args.num_requests,
+                args.min_input_len, args.max_input_len,
+                args.min_output_len, args.max_output_len, args.rate
+            )
     except BaseException:
+        if synchronized_start:
+            try:
+                await master.abort_synchronized_start()
+            except Exception:
+                logger.exception("Could not cancel every synchronized-start worker after failure")
         # A failed capture start may have started only some workers. Try to
         # stop all of them, preserving the original workload/start exception.
         if nsys_enabled:

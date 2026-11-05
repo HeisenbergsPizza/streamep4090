@@ -59,6 +59,8 @@ nsys stats "$tool_check_dir/cuda.nsys-rep"
 
 上传当前 StreamInfer 源码，保留服务器已有依赖和已初始化的 `third_party` 目录，排除本地编译的 `.so` 和 `build/`。本次既有 Python 修改，也有 C++ NVTX 桥接，单独上传 `profile.sh` 不够。
 
+下面的重编步骤用于首次安装带 NVTX 桥接的 profiling 版本。如果服务器已经成功生成过这套入口的四份报告，本次新增的 `--synchronized-start` 只修改 Python，无需因该功能重新编译 C++ 扩展；同步源码后可直接运行第 3.1 节。
+
 在服务器 **StreamInfer 根目录**执行以下命令。Conda 环境应保持原来可以编译和运行 benchmark 的 CUDA 路径设置，参见 [环境配置](rtx4090.md)。
 
 ```bash
@@ -117,15 +119,59 @@ bash experiments/scripts/rtx4090/profile.sh cpu
 
 不要在 `profile.sh` 外再套一层 `nsys profile`，也不要同时传 `--profile-dir`、`--trace` 或 advanced logging。Ray 已为每个 GPU Engine 启动 Nsight；两个 CUPTI collector 可能互相冲突，额外日志也会影响 CPU 开销。
 
+### 3.1 统一起跑，再观察异步推进
+
+使用可选的 `--synchronized-start`，让 64 个请求在四卡上各形成一个 **B=16 的首层 attention batch**。默认入口保持原有行为；单独设置 `--generator-type offline` 仍然只是集中提交请求。
+
+```bash
+# 先检查参数，无需 GPU 或 Nsight。
+bash experiments/scripts/rtx4090/profile.sh trace --dry-run \
+  --synchronized-start --generator-type offline --num-requests 64
+
+# 同样的起跑条件，先采无 profiler 的基线。
+bash experiments/scripts/rtx4090/profile.sh baseline \
+  --synchronized-start --generator-type offline --num-requests 64
+
+# 再采四个 Engine 的 CPU / CUDA 时间线。
+bash experiments/scripts/rtx4090/profile.sh trace \
+  --synchronized-start --generator-type offline --num-requests 64
+```
+
+这组命令沿用初始上下文 64、输出 32、attention cap 16、expert cap 128 和 48 层设置。`offline` 下 `--rate` 不控制起跑时刻。长度参数按 `[min,max)` 生成，因此固定长度 64 对应 `--min-input-len 64 --max-input-len 65`。
+
+起跑流程：
+
+1. 完成原有 warmup，检查四卡都能容纳本轮分配的 KV blocks。
+2. 固定分配 16 个请求到每个 DP rank；各推理线程准备完整的首层 attention batch，等待本卡准备工作完成。
+3. 等全部 Engine 就绪，再开启所有 profiler，发布同一个未来 CPU 时刻。
+4. 各线程在该时刻附近提交首层计算，此后继续原有异步调度，不再设置层间或 token 间的全局起跑门槛。
+
+后续 attention / expert batch 大小由就绪队列决定，可能小于或大于初始 B=16（受各自 cap 限制）；每张卡也可能交错处理不同层。一个 token 仍要等自己的 Top-8 专家结果齐全，才能推进下一层。
+
+目前该模式要求单节点四卡、colocate、TP=1、DP=EP=4、offline、固定输入和输出长度；请求总数必须能被四整除，每卡初始请求数不能超过 attention cap。所有初始请求的 KV blocks 必须同时放得下。`server` 和 `--analyze-throughput` 暂不支持。
+
+**统一的是准备条件和 CPU 放行时刻。** Python 线程、OS 调度、CUDA 提交及 GPU 排队仍会产生起跑偏差，不能据此声称四卡 kernel 严格同时开始。每轮会额外写出 `metrics.csv.synchronized-start.json`：检查四个 worker 的 `initial_batch_size` 都为 16、`layer_id` 都为 0、`req_ids` 覆盖全部 64 个请求，再查看 `cpu_start_skew_ms`。它是各线程 `execute_begin_ns` 的最大差值，实际 GPU 起跑偏差还需看 Nsight 中关联的第一批 kernels。
+
+trace 中可搜索：
+
+- `Engine.synchronized_start.wait`：等待统一放行的 CPU 区间；该范围从采集前开始，报告中可能截断。
+- `Engine.execute.attn.layer=0.batch=16.initial`：每卡首批执行提交。
+- `Engine.execute.attn.layer=L.batch=B` / `Engine.execute.expert.layer=L.batch=B`：后续异步执行提交；层号从 0 开始。
+
+首批准备在采集开始前完成，等待统一放行的区间在 trace 内；benchmark 总时长从共同放行时刻开始计。比较异步分散时，保留各报告的共同时间基准，并先量化首批实际 GPU 起跑偏差。不要把每份报告的首个 kernel 各自平移到零后，再用它们判断跨卡通信重叠。
+
+该模式仍执行合成 decode，使用随机权重和 hidden states；上述命令默认使用随机路由，已有路由配置仍生效。未增加真实 Qwen checkpoint 或 prompt prefill。
+
 ## 4. 输出与查看
 
 默认每次写入新的 `reports/rtx4090/profile-<mode>-<time>-<pid>/`：
 
 - `metrics.csv`：本轮 benchmark 指标。
+- `metrics.csv.synchronized-start.json`：仅统一起跑模式生成，包含初始分配、准备/放行/提交时间及 CPU 起跑偏差；baseline 也会生成。
 - `run.log`：运行日志。
 - `nsys-version.txt` / `nsys-environment.txt`：工具与环境检查，baseline 无此项。
 - `nsight/worker_process_<pid>.nsys-rep`：四个 Engine 的报告。
-- `nsight/manifest.json`：配置、Nsight 参数、Ray 目录、Engine PID / device_id / CUDA_VISIBLE_DEVICES 映射及测量范围。
+- `nsight/manifest.json`：配置、Nsight 参数、Ray 目录、Engine PID / device_id / CUDA_VISIBLE_DEVICES 映射及测量范围；统一起跑模式还包含起跑报告。
 
 可设置 `PROFILE_RUN_DIR=/absolute/path/to/new-run`，目录必须不存在。Ray actor 通常只看到自己的 `cuda:0`；判断物理卡时结合 manifest，不能把四份报告的 cuda:0 当成同一张卡。
 

@@ -1,128 +1,60 @@
+"""CPU discrete-event model of colocated, unified Attention/Expert scheduling.
+
+Compute costs are explicit inputs, not a GPU performance prediction. All time
+values in the API are ticks; one tick defaults to 0.1 ms. See README.md.
+"""
 from __future__ import annotations
 
-import simpy
-import random
-import os
-from collections import deque, defaultdict
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Tuple
 import math
-import sys
-import time
+import heapq
+import os
+import random
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
+from numbers import Integral
+from typing import Callable
+
+import simpy
 import torch
 
-from util import (
-    expert_compute_time_lookup_table_from_profile,
-    build_profile_router,
-)
-from disagmoe.models.gate import ProfileDrivenRouter
+if __package__:
+    from .util import expert_compute_time_lookup_table_from_profile, build_profile_router
+    from .costs import AttentionCostModel, ExpertCostModel
+    from .overheads import BatchOverheadModel, BatchOverheadEstimate, BatchWorkload
+    from .schedulers import UnifiedScheduler, ExpertWiseScheduler
+    from .metrics import Samples, percentile
+    from .queue_trace import QueueTraceRecorder
+    from .token_trace import TokenTraceRecorder
+else:  # direct script execution
+    from util import expert_compute_time_lookup_table_from_profile, build_profile_router
+    from costs import AttentionCostModel, ExpertCostModel
+    from overheads import BatchOverheadModel, BatchOverheadEstimate, BatchWorkload
+    from schedulers import UnifiedScheduler, ExpertWiseScheduler
+    from metrics import Samples, percentile
+    from queue_trace import QueueTraceRecorder
+    from token_trace import TokenTraceRecorder
 
-
-class IngressPort:
-    """Per-GPU receive port with two independent FIFO channels.
-
-    Each GPU has one IngressPort containing:
-      - An NVLink channel for intra-node transfers
-      - An RDMA channel for inter-node transfers
-
-    Each channel processes one transfer at a time at full link bandwidth.
-    The two channels operate independently and can process in parallel.
-    Incoming transfers are classified by topology (same host -> NVLink,
-    different host -> RDMA) and queued on the appropriate channel.
-    """
-
-    def __init__(self, env: simpy.Environment, gpu_idx: int, n_gpu_per_host: int):
-        self.env = env
-        self.gpu_idx = int(gpu_idx)
-        self.n_gpu_per_host = max(1, int(n_gpu_per_host))
-        self._nvlink = simpy.Resource(env, capacity=1)
-        self._rdma = simpy.Resource(env, capacity=1)
-
-    def _is_same_host(self, other_gpu: int) -> bool:
-        return (self.gpu_idx // self.n_gpu_per_host) == (int(other_gpu) // self.n_gpu_per_host)
-
-    def transfer(self, src_gpu: int, solo_delay: float) -> simpy.events.Event:
-        """Queue a transfer from *src_gpu* with the given full-bandwidth delay.
-
-        The transfer is routed to the NVLink channel if *src_gpu* is on the
-        same host as this GPU, or the RDMA channel otherwise.
-
-        Returns a simpy event that triggers when this transfer completes.
-        """
-        if solo_delay <= 0:
-            return self.env.timeout(0)
-
-        is_intra = self._is_same_host(src_gpu)
-        resource = self._nvlink if is_intra else self._rdma
-        done_event = self.env.event()
-        self.env.process(self._do_transfer(resource, solo_delay, done_event))
-        return done_event
-
-    def _do_transfer(self, resource: simpy.Resource, delay: float, done_event: simpy.events.Event):
-        """FIFO transfer: acquire the channel, hold for *delay* ticks, release."""
-        req = resource.request()
-        yield req
-        yield self.env.timeout(delay)
-        resource.release(req)
-        if not done_event.triggered:
-            done_event.succeed()
-
-
-# ------------------------------
-# Configurable parameters
-# ------------------------------
-
-EP_GROUP_SIZE      = 16      # "n": number of expert workers globally
-TOTAL_EXPERT_COUNT = 128     # total experts per layer
-MAX_BATCH_SIZE     = 512
-NUM_LAYERS         = 48      # number of expert layers
-TOTAL_REQUESTS     = 8192
+EP_GROUP_SIZE = 16
+TOTAL_EXPERT_COUNT = 128
+MAX_BATCH_SIZE = 512
+NUM_LAYERS = 48
+TOTAL_REQUESTS = 8192
 TOKENS_PER_REQUEST = 256
-TOTAL_TOKENS       = TOTAL_REQUESTS * TOKENS_PER_REQUEST
-GLOBAL_REQUEST_MAX_BATCH_SIZE = EP_GROUP_SIZE * 256  # max concurrent active requests
-
-ARRIVAL_RATE       = 50.0   # lambda for Poisson arrivals (requests / tick)
-# try for each attention worker, devide the arrival rate by the number of attention workers
-
-ATTN_SERVICE_T     = 2    # time (ticks) per token at attention worker
-ATTN_DP_GROUP_SIZE = EP_GROUP_SIZE  # number of parallel attention workers globally
-TICKS_PER_MILLISECOND = 10  # 0.1 ms per tick
-
-NET_T_EXPERT_TO_ATTN  = 0.1  # fixed network delay expert -> attention in #ticks, 10us
-NET_T_ATTN_TO_EXPERT  = 0.1  # fixed network delay attention -> expert in #ticks, 10us
-
-# Speedup factor for grouped GEMM vs single-expert profile.
-# When batching all experts in a layer together (like the real system),
-# grouped GEMM kernels are more efficient than processing experts one-by-one.
-GROUP_GEMM_SPEEDUP_FACTOR = 0.7
-
+TOTAL_TOKENS = TOTAL_REQUESTS * TOKENS_PER_REQUEST
+GLOBAL_REQUEST_MAX_BATCH_SIZE = EP_GROUP_SIZE * 256
+ARRIVAL_RATE = 50.0  # requests / tick
+ATTN_SERVICE_T = 2.0  # fallback time per token, not a measurement
+ATTN_DP_GROUP_SIZE = EP_GROUP_SIZE
+TICKS_PER_MILLISECOND = 10
+NET_T_EXPERT_TO_ATTN = 0.1
+NET_T_ATTN_TO_EXPERT = 0.1
+GROUP_GEMM_SPEEDUP_FACTOR = 1.0  # retained name; no implicit speedup
 RNG_SEED = 42
-
-EXPERT_COMPUTE_PROFILE_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "expert_costs_profiles",
-    "Qwen3-30B.csv",
-)
-
 ROUTING_TOP_K = 8
-PROFILE_ROUTING_PATH = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "gating_profiles",
-        "gating_sharegptv3_155.parquet",
-    )
-)
+SCHEDULING_POLICY = "defrag"
+EXPERT_COMPUTE_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "expert_costs_profiles", "Qwen3-30B.csv")
+PROFILE_ROUTING_PATH = os.path.join(os.path.dirname(__file__), "..", "gating_profiles", "gating_sharegptv3_155.parquet")
 
-# Expert scheduling policy used by each ExpertWorker.
-#   "longest_queue_first" (default): pick the single longest queue.
-#   "defragging_v0": approximate the C++ GroupLayerScheduler, looking
-#                   ahead across layers for the same local expert id.
-SCHEDULING_POLICY = "defragging_v0"
-
-# ------------------------------
-# Token representation
-# ------------------------------
 
 @dataclass
 class Token:
@@ -130,1375 +62,943 @@ class Token:
     birth_time: float
     request_id: int
     token_index: int
-    # Models the attention (DP) GPU assigned to this request/token. Used for
-    # topology-aware network delay modeling.
     home_gpu: int = 0
-    layer_fanout: Dict[int, int] = field(default_factory=dict)
-    # Stores how many experts each layer routed the token through.
+    layer_fanout: dict[int, int] = field(default_factory=dict)
     sampled_for_stats: bool = False
+    previous_completion_time: float | None = None
+    attention_ready_wait: float = 0.0
+    expert_ready_wait: float = 0.0  # sum over branches, not token critical-path wait
+    finalize_ready_wait: float = 0.0
+    join_wait: float = 0.0  # sum of first-to-last return gaps over layers
+    reformation_inputs: tuple[tuple[int, int], ...] = ()  # logical (buffer, row), current layer only
+    output_batch_id: int | None = None
+
 
 @dataclass
-class DefragV0DebugState:
-    enabled: bool = False
-    triggered: bool = False
-    trigger_time: float | None = None
-    trigger_request_id: int | None = None
-    trigger_active_requests: int | None = None
-    trigger_pending_queue_len: int | None = None
-
-    get_active_requests: Callable[[], int] | None = None
-    get_pending_queue_len: Callable[[], int] | None = None
-    get_global_expert_queued_tokens: Callable[[], int] | None = None
-    get_global_expert_inflight_tokens: Callable[[], int] | None = None
-    get_per_worker_expert_queued_tokens: Callable[[], List[int]] | None = None
-    get_per_worker_expert_inflight_tokens: Callable[[], List[int]] | None = None
-    get_attention_users: Callable[[], int] | None = None
-    get_attention_queue: Callable[[], int] | None = None
-    get_pending_tokens_total: Callable[[], int] | None = None
-    get_pending_tokens_per_layer: Callable[[], List[int]] | None = None
-    get_tokens_created: Callable[[], int] | None = None
-    get_tokens_completed: Callable[[], int] | None = None
-
-    logged: bool = False
-    log_time: float | None = None
-    worker_idx: int | None = None
-    entry: Dict[str, object] | None = None
+class Branch:
+    token: Token
+    expert_id: int
+    layer: int
+    buffer_id: int | None = None
+    buffer_row: int = 0
+    output_batch_id: int | None = None
 
 
-class RequestManager:
+@dataclass
+class Join:
+    token: Token
+    remaining: set[int]
+    first_return: float | None = None
+    input_rows: list[tuple[int, int]] = field(default_factory=list)
+
+
+def _validate_workload_overrides(sim):
+    arrivals = getattr(sim, "arrival_times_ms", None)
+    mapping = getattr(sim, "routing_request_indices", None)
+    if arrivals is not None:
+        arrivals = tuple(arrivals)
+        if len(arrivals) != sim.total_requests:
+            raise ValueError("arrival_times_ms length must match total_requests")
+        previous = 0.0
+        for value in arrivals:
+            if isinstance(value, bool) or not math.isfinite(value) or value < previous:
+                raise ValueError("arrival_times_ms must be finite, nonnegative and monotonic")
+            if not math.isfinite(value * sim.ticks_per_ms):
+                raise ValueError("arrival_times_ms exceeds the simulation clock range")
+            previous = value
+        arrivals = tuple(float(value) for value in arrivals)
+    if mapping is not None:
+        mapping = tuple(mapping)
+        if len(mapping) != sim.total_requests:
+            raise ValueError("routing_request_indices length must match total_requests")
+        if any(isinstance(index, bool) or not isinstance(index, Integral)
+               or not 0 <= index < sim.router.num_profiled_requests for index in mapping):
+            raise ValueError("routing_request_indices must contain valid profile request ordinals")
+    if arrivals is not None or mapping is not None:
+        selected = set(mapping) if mapping is not None else range(min(sim.total_requests, sim.router.num_profiled_requests))
+        if any(len(sim.router.profiled_token_indices[index]) < sim.tokens_per_request for index in selected):
+            raise ValueError("selected routing request has insufficient tokens; explicit workloads cannot wrap token routes")
+    sim.arrival_times_ms, sim.routing_request_indices = arrivals, mapping
+
+
+class IngressPort:
+    """Two independent FIFO receive resources; no sender/NVSwitch contention.
+
+    Same-GPU transfers bypass both queues. Network delay includes service time
+    only; waiting for a busy receive resource is accounted separately.
     """
-    Manages sequential per-request token dispatch. A new request begins with
-    token 0, and token i+1 is only injected after token i fully completes.
-    """
-
-    def __init__(self, env, tokens_per_request: int,
-                 record_completion_cb: Callable[[Token, float], None],
-                 request_complete_cb: Callable[[int, float], None] | None = None,
-                 max_active_requests: int | None = None,
-                 attn_dp_group_size: int = 1,
-                 defrag_v0_debug_state: DefragV0DebugState | None = None,
-                 token_begin_cb: Callable[[Token], None] | None = None):
+    def __init__(self, env, gpu_idx, n_gpu_per_host, wait_stats=None, observer=None):
         self.env = env
-        self.tokens_per_request = tokens_per_request
-        self._record_completion = record_completion_cb
-        self._request_complete_cb = request_complete_cb
-        self.max_active_requests = max_active_requests
-        self.attn_dp_group_size = max(1, int(attn_dp_group_size))
-        self._defrag_v0_debug_state = defrag_v0_debug_state
-        self._token_begin_cb = token_begin_cb
-        self.first_attention: AttentionWorker | None = None
-        self._next_tid = 0
-        self._request_state: Dict[int, int] = {}
-        self._request_start_time: Dict[int, float] = {}
-        self._request_home_gpu: Dict[int, int] = {}
-        self._next_home_gpu = 0
-        self._pending_queue = deque()
-
-    def set_first_attention(self, attention_worker: AttentionWorker):
-        self.first_attention = attention_worker
-
-    @property
-    def active_requests(self) -> int:
-        return len(self._request_state)
-
-    @property
-    def pending_queue_len(self) -> int:
-        return len(self._pending_queue)
-
-    def admit_request(self, request_id: int, arrival_time: float):
-        if self.max_active_requests is None or self.active_requests < self.max_active_requests:
-            self._start_request_now(request_id, arrival_time)
-        else:
-            self._pending_queue.append((request_id, arrival_time))
-
-    def _start_request_now(self, request_id: int, arrival_time: float):
-        if request_id in self._request_state:
-            raise ValueError(f"Request {request_id} already started")
-        self._request_state[request_id] = 0
-        self._request_start_time[request_id] = arrival_time
-        self._request_home_gpu[request_id] = (self._next_home_gpu % self.attn_dp_group_size)
-        self._next_home_gpu += 1
-
-        dbg = self._defrag_v0_debug_state
-        if (
-            dbg is not None
-            and dbg.enabled
-            and not dbg.triggered
-            and self.max_active_requests is not None
-            and self.active_requests >= self.max_active_requests
-        ):
-            dbg.triggered = True
-            dbg.trigger_time = self.env.now
-            dbg.trigger_request_id = request_id
-            dbg.trigger_active_requests = self.active_requests
-            dbg.trigger_pending_queue_len = self.pending_queue_len
-
-        self._dispatch_next_token(request_id)
-
-    def handle_token_completion(self, token: Token, completion_time: float):
-        self._record_completion(token, completion_time)
-        rid = token.request_id
-        if rid not in self._request_state:
-            raise RuntimeError(f"Completion received for unknown request {rid}")
-
-        if token.token_index + 1 < self.tokens_per_request:
-            self._dispatch_next_token(rid)
-        else:
-            # Request fully finished; drop state for bookkeeping
-            self._request_state.pop(rid, None)
-            start_time = self._request_start_time.pop(rid, token.birth_time)
-            self._request_home_gpu.pop(rid, None)
-            if self._request_complete_cb is not None:
-                self._request_complete_cb(rid, completion_time - start_time)
-            self._maybe_admit_queued_requests()
-
-    def _dispatch_next_token(self, request_id: int):
-        if self.first_attention is None:
-            raise RuntimeError("First attention worker not initialized yet.")
-
-        next_idx = self._request_state.get(request_id)
-        if next_idx is None:
-            raise RuntimeError(f"Request {request_id} not tracked for dispatch.")
-        if next_idx >= self.tokens_per_request:
-            return
-
-        home_gpu = self._request_home_gpu.get(request_id)
-        if home_gpu is None:
-            raise RuntimeError(f"Request {request_id} missing home_gpu assignment.")
-
-        token = Token(
-            tid=self._next_tid,
-            birth_time=self.env.now,
-            request_id=request_id,
-            token_index=next_idx,
-            home_gpu=int(home_gpu),
-        )
-        self._next_tid += 1
-        self._request_state[request_id] = next_idx + 1
-        if self._token_begin_cb is not None:
-            self._token_begin_cb(token)
-        self.first_attention.enqueue(token)
-
-    def _maybe_admit_queued_requests(self):
-        if self.max_active_requests is None:
-            while self._pending_queue:
-                rid, ts = self._pending_queue.popleft()
-                self._start_request_now(rid, ts)
-            return
-
-        while self._pending_queue and self.active_requests < self.max_active_requests:
-            rid, ts = self._pending_queue.popleft()
-            self._start_request_now(rid, ts)
-
-
-class FinalCompletionTracker:
-    """
-    Aggregates completions for the final layer so a token only finishes after
-    every routed expert replica returned.
-    """
-
-    def __init__(self, final_layer_idx: int, completion_callback):
-        self.final_layer_idx = final_layer_idx
-        self.completion_callback = completion_callback
-        self._pending_counts = defaultdict(int)
-
-    def record_completion(self, token: Token, now: float):
-        expected = token.layer_fanout.get(self.final_layer_idx)
-        if expected is None or expected <= 0:
-            raise RuntimeError(
-                f"No fanout recorded for token {token.tid} at final layer {self.final_layer_idx}"
-            )
-
-        key = token.tid
-        new_count = self._pending_counts[key] + 1
-        if new_count < expected:
-            self._pending_counts[key] = new_count
-            return
-        if new_count == expected:
-            self._pending_counts.pop(key, None)
-            self.completion_callback(token, now)
-            return
-        raise RuntimeError(
-            f"Token {token.tid} received more final completions ({new_count}) than expected ({expected})"
-        )
-
-
-class ProgressTracker:
-    """Simple stdout progress bar with ETA estimation."""
-
-    def __init__(self, total_tokens: int, bar_width: int = 30, min_interval: float = 1.0):
-        self.total = max(0, int(total_tokens))
-        self.bar_width = bar_width
-        self.min_interval = min_interval
-        self.start_time = time.perf_counter()
-        self.last_render = 0.0
-        self.finished = False
-
-    def update(self, completed: int, force: bool = False):
-        if self.finished and not force:
-            return
-
-        now = time.perf_counter()
-        if (
-            not force
-            and completed < self.total
-            and (now - self.last_render) < self.min_interval
-        ):
-            return
-
-        pct = 1.0 if self.total == 0 else min(1.0, max(0.0, completed / float(self.total)))
-        elapsed = now - self.start_time
-        eta = self._estimate_eta(elapsed, pct, completed)
-
-        bar_fill = int(self.bar_width * pct)
-        bar = "#" * bar_fill + "-" * (self.bar_width - bar_fill)
-        eta_str = self._format_duration(eta)
-        elapsed_str = self._format_duration(elapsed)
-
-        sys.stdout.write(
-            f"\r[{bar}] {pct * 100:5.1f}% ({completed}/{self.total}) "
-            f"Elapsed {elapsed_str} ETA {eta_str}"
-        )
-        sys.stdout.flush()
-        self.last_render = now
-
-        if completed >= self.total and not self.finished:
-            self.finished = True
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-
-    def finalize(self):
-        if not self.finished:
-            self.update(self.total, force=True)
-            if not self.finished:
-                self.finished = True
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-
-    def _estimate_eta(self, elapsed: float, pct: float, completed: int) -> float:
-        if completed >= self.total or pct <= 0.0:
-            return 0.0
-        remaining = (1.0 - pct) * elapsed / pct
-        return remaining
-
-    @staticmethod
-    def _format_duration(seconds: float) -> str:
-        if seconds is None or not (seconds < float("inf")):
-            return "--:--"
-        if seconds <= 0:
-            return "00:00"
-        total_seconds = int(seconds + 0.5)
-        mins, sec = divmod(total_seconds, 60)
-        hrs, mins = divmod(mins, 60)
-        if hrs > 99:
-            return ">99h"
-        if hrs > 0:
-            return f"{hrs:02d}:{mins:02d}:{sec:02d}"
-        return f"{mins:02d}:{sec:02d}"
-
-
-def percentile(values: List[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    if pct <= 0.0:
-        return min(values)
-    if pct >= 1.0:
-        return max(values)
-    sorted_vals = sorted(values)
-    k = pct * (len(sorted_vals) - 1)
-    lower = math.floor(k)
-    upper = math.ceil(k)
-    if lower == upper:
-        return sorted_vals[int(k)]
-    frac = k - lower
-    return sorted_vals[lower] + (sorted_vals[upper] - sorted_vals[lower]) * frac
-
-
-# ------------------------------
-# Expert worker
-# ------------------------------
-
-class ExpertWorker:
-    """
-    Represents one expert worker that is shared across all layers.
-    It owns `num_queues_per_worker_per_layer` queues per layer (for experts assigned
-    to this worker), i.e. a total of `num_layers * num_queues_per_worker_per_layer`
-    queues.
-
-    It always picks the *longest* queue ACROSS ALL LAYERS to form the largest batch,
-    up to MAX_BATCH_SIZE.
-    Batch compute time depends on the formed batch size, using a loaded profile.
-    Then each token in the batch is sent to the NEXT layer's attention worker
-    (or marked finished if this is the last layer).
-    """
-    def __init__(
-        self,
-        env,
-        worker_idx,
-        num_layers,
-        num_queues_per_worker_per_layer,
-        max_batch_size,
-        compute_time_lookup,
-        net_t_expert_to_attn,
-        attention_layers,
-        final_completion_tracker: FinalCompletionTracker,
-        *,
-        net_delay_fn: Callable[[int, int, int], float] | None = None,
-        ingress_ports: List[IngressPort] | None = None,
-        batch_stats=None,
-        defrag_v0_debug_state: DefragV0DebugState | None = None,
-        scheduling_policy: str = "longest_queue_first",
-        routing_top_k: int = ROUTING_TOP_K,
-    ):
-        self.env = env
-        self.worker_idx = worker_idx
-        self.num_layers = num_layers
-        self.num_queues_per_worker_per_layer = num_queues_per_worker_per_layer
-        self.max_batch_size = max_batch_size
-        self._compute_time_lookup = compute_time_lookup
-        self.net_t_expert_to_attn = net_t_expert_to_attn
-        self.net_delay_fn = net_delay_fn
-        self.ingress_ports = ingress_ports
-        self.attention_layers = attention_layers
-        self.final_completion_tracker = final_completion_tracker
-        self._batch_stats = batch_stats
-        self._total_queue_length = 0
-        self.scheduling_policy = scheduling_policy
-        self._defrag_v0_debug_state = defrag_v0_debug_state
-        self._inflight_batch_size = 0
-        self._inflight_attention = False
-        self.routing_top_k = max(1, int(routing_top_k))
-
-        # Per-GPU attention queue. This models the constraint that a GPU cannot
-        # compute attention while it is computing an expert batch (and vice
-        # versa). Tokens are enqueued here by AttentionWorker.enqueue() based on
-        # token.home_gpu.
-        self.attention_queue: deque[tuple["AttentionWorker", Token]] = deque()
-
-        # Per-layer, per-expert queues:
-        # queues[layer_idx][local_queue_idx]
-        self.queues = [
-            [deque() for _ in range(num_queues_per_worker_per_layer)]
-            for _ in range(num_layers)
-        ]
-
-        # Event used for waking the worker when new work arrives
-        self.has_work = env.event()
-
-        # Start main process
-        self.proc = env.process(self.run())
-
-    @property
-    def total_queue_length(self):
-        return self._total_queue_length
-
-    @property
-    def attention_queue_length(self) -> int:
-        return len(self.attention_queue)
-
-    @property
-    def inflight_attention(self) -> bool:
-        return bool(self._inflight_attention)
-
-    def enqueue(self, layer_idx: int, local_queue_idx: int, token: Token):
-        q = self.queues[layer_idx][local_queue_idx]
-        was_empty = (self._total_queue_length == 0 and not self.attention_queue)
-        q.append(token)
-        self._total_queue_length += 1
-        # Wake the worker if it was idle
-        if was_empty and not self.has_work.triggered:
-            self.has_work.succeed()
-
-    def enqueue_attention(self, attention_layer: "AttentionWorker", token: Token):
-        was_empty = (self._total_queue_length == 0 and not self.attention_queue)
-        self.attention_queue.append((attention_layer, token))
-        if was_empty and not self.has_work.triggered:
-            self.has_work.succeed()
-
-    def run(self):
-        """
-        Main loop for the expert worker.
-
-        Scheduling is at LAYER granularity, matching the real C++ system:
-        - UnifiedDefraggingLayerScheduler picks a layer_id
-        - get_batch_from_layer() merges ALL tokens for that layer
-        - Expert executor uses grouped GEMM to process all experts together
-
-        The scheduling policy controls HOW the layer is selected:
-          - "longest_queue_first": pick the layer with the most total tokens.
-          - "defragging_v0": use lookahead scoring matching C++.
-        """
-        while True:
-            if self._total_queue_length == 0 and not self.attention_queue:
-                # No work: go to sleep
-                self.has_work = self.env.event()
-                yield self.has_work
-
-            task_kind, payload = self._select_next_task()
-            if task_kind == "attention":
-                attention_layer, token = payload
-                self._inflight_attention = True
-                yield self.env.timeout(attention_layer.attn_service_t)
-                self._inflight_attention = False
-                # Schedule routing + dispatch asynchronously so this GPU can
-                # start the next compute immediately.
-                self.env.process(attention_layer.route_and_dispatch(token))
-                continue
-
-            # payload is layer_idx (or None if no work)
-            chosen_layer_idx = payload
-            if chosen_layer_idx is None:
-                continue
-
-            # Form a batch from ALL queues for this layer (matching TokenBatch::merge)
-            batch: List[Token] = []
-            for local_queue in self.queues[chosen_layer_idx]:
-                while local_queue and len(batch) < self.max_batch_size:
-                    batch.append(local_queue.popleft())
-                    self._total_queue_length -= 1
-
-            if not batch:
-                continue
-
-            # Track batch size statistics if requested.
-            if self._batch_stats is not None:
-                self._batch_stats["total_batch_size"] += len(batch)
-                self._batch_stats["total_batches"] += 1
-
-            # Expert compute with grouped GEMM speedup
-            # (matches sync/tbo which apply GROUP_GEMM_SPEEDUP_FACTOR)
-            self._inflight_batch_size = len(batch)
-            base_compute_t = self._compute_time_lookup[len(batch)]
-            compute_t = base_compute_t * GROUP_GEMM_SPEEDUP_FACTOR
-            yield self.env.timeout(compute_t)
-
-            # Network delay to attention / completion.
-            # With congestion-aware simulation, each destination GPU's ingress
-            # port fair-shares bandwidth among concurrent senders. We group
-            # tokens by home_gpu and fire concurrent transfers.
-            if self.ingress_ports is not None and self.net_delay_fn is not None:
-                # Group tokens by destination (home_gpu)
-                tokens_per_dst: Dict[int, int] = defaultdict(int)
-                for token in batch:
-                    tokens_per_dst[int(token.home_gpu)] += 1
-
-                # Fire concurrent transfers to each destination's ingress port
-                transfer_events = []
-                for dst_gpu, count in tokens_per_dst.items():
-                    solo_delay = float(
-                        self.net_delay_fn(int(self.worker_idx), dst_gpu, count)
-                    )
-                    if solo_delay > 0:
-                        transfer_events.append(
-                            self.ingress_ports[dst_gpu].transfer(int(self.worker_idx), solo_delay)
-                        )
-
-                if transfer_events:
-                    yield simpy.events.AllOf(self.env, transfer_events)
-            else:
-                delay = self.net_t_expert_to_attn
-                yield self.env.timeout(delay)
-            self._inflight_batch_size = 0
-
-            # Route tokens onward
-            for token in batch:
-                if chosen_layer_idx == self.num_layers - 1:
-                    # Last layer expert => feed into final completion tracker
-                    self.final_completion_tracker.record_completion(token, self.env.now)
-                else:
-                    # Send to next layer's attention worker pending list
-                    next_attn = self.attention_layers[chosen_layer_idx + 1]
-                    next_attn.notify_expert_completion(token)
-
-    def _select_next_task(self):
-        """
-        Select the next unit of work for this GPU:
-          - an expert batch from a layer (all queues for that layer), or
-          - one attention token from this GPU's attention queue.
-
-        Returns:
-          ("attention", (attention_layer, token)) or
-          ("expert", layer_idx_or_None)
-        """
-        attention_score = (
-            float(len(self.attention_queue)) * float(self.routing_top_k)
-            if self.attention_queue
-            else 0.0
-        )
-
-        # Use layer-level scheduling (matching real system behavior)
-        if self.scheduling_policy == "defragging_v0":
-            layer_idx, score = self._select_next_layer_defragging()
-        else:
-            layer_idx, score = self._select_next_layer_longest_first()
-
-        if self.attention_queue and (layer_idx is None or attention_score > float(score)):
-            return "attention", self.attention_queue.popleft()
-        return "expert", layer_idx
-
-    def _select_next_queue_longest_queue_first(self):
-        """Original policy: pick the single longest queue across all layers."""
-        max_q = None
-        max_len = 0
-        chosen_layer_idx = None
-
-        for layer_idx, layer_queues in enumerate(self.queues):
-            for q in layer_queues:
-                q_len = len(q)
-                if q_len > max_len:
-                    max_len = q_len
-                    max_q = q
-                    chosen_layer_idx = layer_idx
-
-        if max_q is None or max_len == 0:
-            return None, None, 0.0
-        return chosen_layer_idx, max_q, float(max_len)
-
-    def _select_next_layer_longest_first(self) -> tuple[int | None, float]:
-        """
-        Layer-level scheduling: pick the layer with the most total tokens.
-        This matches the real system behavior where scheduling is at layer
-        granularity, not per-expert queue.
-        """
-        best_layer_idx = None
-        best_score = 0.0
-
-        for layer_idx, layer_queues in enumerate(self.queues):
-            layer_total = sum(len(q) for q in layer_queues)
-            if layer_total > best_score:
-                best_score = float(layer_total)
-                best_layer_idx = layer_idx
-
-        return best_layer_idx, best_score
-
-    def _select_next_layer_defragging(self) -> tuple[int | None, float]:
-        """
-        Layer-level defragging scheduler matching C++ UnifiedDefraggingLayerScheduler.
-
-        Computes a score for each layer based on:
-        1. Immediate tokens in the layer (sum across all local expert queues)
-        2. Lookahead score: decayed sum of tokens in future layers
-
-        This matches the real system where scheduling is at layer granularity,
-        then all tokens for that layer are batched together for grouped GEMM.
-        """
-        n_layers = self.num_layers
-        if n_layers <= 0:
-            return None, 0.0
-
-        # Scheduler parameters (match C++ defaults)
-        weight_decay = 0.8
-        lookahead_steps = 4
-
-        # Compute total tokens per layer
-        queues = self.queues
-        layer_totals = [0] * n_layers
-        for layer_idx in range(n_layers):
-            layer_totals[layer_idx] = sum(len(q) for q in queues[layer_idx])
-
-        # Early exit if no work
-        total_tokens = sum(layer_totals)
-        if total_tokens == 0:
-            return None, 0.0
-
-        # Compute per-layer scores with lookahead
-        scores = [0.0] * n_layers
-        for i in range(n_layers):
-            # Immediate tokens in this layer
-            immediate = float(layer_totals[i])
-            if immediate <= 0:
-                continue
-
-            # Compute lookahead score
-            lookahead_score = 0.0
-            decay = weight_decay
-            for k in range(1, lookahead_steps):
-                cur_layer = (i + k) % n_layers
-                num_tokens_cur_layer = layer_totals[cur_layer]
-                if num_tokens_cur_layer > 0:
-                    lookahead_score += num_tokens_cur_layer * decay
-                decay *= weight_decay
-
-            scores[i] = immediate + lookahead_score
-
-        # Find best layer
-        best_layer_idx = None
-        best_score = 0.0
-        for i in range(n_layers):
-            if scores[i] > best_score:
-                best_score = scores[i]
-                best_layer_idx = i
-
-        return best_layer_idx, best_score
-
-    def _select_next_queue_defragging_v0(self):
-        """
-        "Defragging" policy inspired by GroupLayerScheduler::schedule.
-
-        We treat each (layer_idx, local_expert_idx) as a "layer_group". For a
-        given starting layer i and local expert j, we look ahead across layers
-        for the same local expert j and accumulate a decayed score based on how
-        many tokens are queued in those future layers. Queues that are busy in
-        both the current and upcoming layers are preferred.
-        """
-        n_layers = self.num_layers
-        n_groups = self.num_queues_per_worker_per_layer
-        if n_layers <= 0 or n_groups <= 0:
-            return None, None
-
-        # scheduler parameters
-        weight_decay = 0.95
-        lookahead_steps = 4
-
-        best_score = 0.0
-        best_layer_idx = None
-        best_group_idx = None
-
-        # Precompute per-layer total queue lengths for this worker so that
-        # we can approximate the "lookahead" load across all experts in a
-        # given layer.
-        queues = self.queues
-        layer_totals = [0] * n_layers
-        queue_len_matrix = [[0] * n_groups for _ in range(n_layers)]
-        for layer_idx in range(n_layers):
-            total = 0
-            for group_idx, q in enumerate(queues[layer_idx]):
-                q_len = len(q)
-                queue_len_matrix[layer_idx][group_idx] = q_len
-                total += q_len
-            layer_totals[layer_idx] = total
-
-        inv_n_groups = 1.0 / float(n_groups)
-        lookahead_scores_by_layer = [0.0] * n_layers
-        score_matrix: List[List[float | None]] = [
-            [None] * n_groups for _ in range(n_layers)
-        ]
-
-        for i in range(n_layers):
-            # Compute lookahead score shared by all groups at layer i.
-            lookahead_score = 0.0
-            decay = weight_decay
-            for k in range(1, lookahead_steps):
-                cur_layer = (i + k) % n_layers
-                num_tokens_cur_layer = layer_totals[cur_layer]
-                if num_tokens_cur_layer > 0:
-                    lookahead_score += num_tokens_cur_layer * decay * inv_n_groups
-                decay *= weight_decay
-            lookahead_scores_by_layer[i] = lookahead_score
-
-            # Now compute per-(layer, group) scores, only for non-empty queues
-            # at the current layer. Queues with more tokens in the current
-            # layer and busy future layers will have higher scores.
-            layer_queues = queues[i]
-            for j in range(n_groups):
-                q = layer_queues[j]
-                local_len = len(q)
-                if local_len <= 0:
-                    continue
-                score = lookahead_score + float(local_len)
-                score_matrix[i][j] = score
-                if best_layer_idx is None or score > best_score:
-                    best_score = score
-                    best_layer_idx = i
-                    best_group_idx = j
-
-        dbg = self._defrag_v0_debug_state
-        if (
-            dbg is not None
-            and dbg.enabled
-            and dbg.triggered
-        ):
-            active_requests_at_log_time = (
-                dbg.get_active_requests() if dbg.get_active_requests is not None else None
-            )
-            pending_queue_len_at_log_time = (
-                dbg.get_pending_queue_len() if dbg.get_pending_queue_len is not None else None
-            )
-            global_expert_queued_tokens = (
-                dbg.get_global_expert_queued_tokens()
-                if dbg.get_global_expert_queued_tokens is not None
-                else None
-            )
-            global_expert_inflight_tokens = (
-                dbg.get_global_expert_inflight_tokens()
-                if dbg.get_global_expert_inflight_tokens is not None
-                else None
-            )
-            per_worker_expert_queued_tokens = (
-                dbg.get_per_worker_expert_queued_tokens()
-                if dbg.get_per_worker_expert_queued_tokens is not None
-                else None
-            )
-            per_worker_expert_inflight_tokens = (
-                dbg.get_per_worker_expert_inflight_tokens()
-                if dbg.get_per_worker_expert_inflight_tokens is not None
-                else None
-            )
-            attention_users = (
-                dbg.get_attention_users() if dbg.get_attention_users is not None else None
-            )
-            attention_queue = (
-                dbg.get_attention_queue() if dbg.get_attention_queue is not None else None
-            )
-            pending_tokens_total = (
-                dbg.get_pending_tokens_total()
-                if dbg.get_pending_tokens_total is not None
-                else None
-            )
-            pending_tokens_per_layer = (
-                dbg.get_pending_tokens_per_layer()
-                if dbg.get_pending_tokens_per_layer is not None
-                else None
-            )
-            tokens_created = (
-                dbg.get_tokens_created() if dbg.get_tokens_created is not None else None
-            )
-            tokens_completed = (
-                dbg.get_tokens_completed() if dbg.get_tokens_completed is not None else None
-            )
-            tokens_inflight_unique = (
-                (int(tokens_created) - int(tokens_completed))
-                if tokens_created is not None and tokens_completed is not None
-                else None
-            )
-
-            dbg.logged = True
-            dbg.log_time = self.env.now
-            dbg.worker_idx = self.worker_idx
-            dbg.entry = {
-                "scheduling_policy": "defragging_v0",
-                "worker_idx": self.worker_idx,
-                "log_time": self.env.now,
-                "trigger_time": dbg.trigger_time,
-                "trigger_request_id": dbg.trigger_request_id,
-                "trigger_active_requests": dbg.trigger_active_requests,
-                "trigger_pending_queue_len": dbg.trigger_pending_queue_len,
-                "active_requests_at_log_time": active_requests_at_log_time,
-                "pending_queue_len_at_log_time": pending_queue_len_at_log_time,
-                "global_expert_queued_tokens": global_expert_queued_tokens,
-                "global_expert_inflight_tokens": global_expert_inflight_tokens,
-                "global_expert_total_tokens": (
-                    (int(global_expert_queued_tokens) + int(global_expert_inflight_tokens))
-                    if global_expert_queued_tokens is not None and global_expert_inflight_tokens is not None
-                    else None
-                ),
-                "per_worker_expert_queued_tokens": per_worker_expert_queued_tokens,
-                "per_worker_expert_inflight_tokens": per_worker_expert_inflight_tokens,
-                "attention_users": attention_users,
-                "attention_queue": attention_queue,
-                "pending_tokens_total": pending_tokens_total,
-                "pending_tokens_per_layer": pending_tokens_per_layer,
-                "tokens_created": tokens_created,
-                "tokens_completed": tokens_completed,
-                "tokens_inflight_unique": tokens_inflight_unique,
-                "weight_decay": weight_decay,
-                "lookahead_steps": lookahead_steps,
-                "queue_len_matrix": queue_len_matrix,
-                "layer_totals": layer_totals,
-                "lookahead_scores_by_layer": lookahead_scores_by_layer,
-                "score_matrix": score_matrix,
-                "best_layer_idx": best_layer_idx,
-                "best_group_idx": best_group_idx,
-                "best_score": best_score,
-            }
-
-        if best_layer_idx is None or best_group_idx is None:
-            return None, None, 0.0
-        return best_layer_idx, queues[best_layer_idx][best_group_idx], float(best_score)
-
-
-# ------------------------------
-# Attention + gating worker
-# ------------------------------
-
-class AttentionWorker:
-    """
-    Maintains a pending list of partial expert completions for this layer and
-    hands fully-ready tokens to a *per-GPU* attention queue. Each token's
-    `home_gpu` selects which GPU processes its attention compute, and that GPU
-    serializes attention with expert compute.
-
-    Semantics:
-      - Tokens "arrive" to the attention system either from the request source
-        (layer 0) or when all top-k experts in the previous layer finish.
-      - Attention is queued per GPU (token.home_gpu). Across all GPUs, at most
-        one attention token per GPU can be processed at a time.
-      - After attention/gating:
-          * the token is routed to all top-k experts from the profile-driven
-            router for this layer;
-          * a fixed NET_T_ATTN_TO_EXPERT delay is paid before enqueuing the
-            token into every selected expert worker for this layer.
-    """
-    def __init__(self, env, layer_idx,
-                 total_expert_count,
-                 ep_group_size,
-                 attn_service_t,
-                 net_t_attn_to_expert,
-                 expert_workers,
-                 profile_router: ProfileDrivenRouter,
-                 *,
-                 net_delay_fn: Callable[[int, int, int], float] | None = None,
-                 ingress_ports: List[IngressPort] | None = None):
-        self.env = env
-        self.layer_idx = layer_idx
-        self.total_expert_count = total_expert_count
-        self.ep_group_size = ep_group_size
-        self.attn_service_t = attn_service_t
-        self.net_t_attn_to_expert = net_t_attn_to_expert
-        self.net_delay_fn = net_delay_fn
-        self.ingress_ports = ingress_ports
-        self.expert_workers = expert_workers
-        self.profile_router = profile_router
-
-        self.pending_tokens: Dict[int, Token] = {}
-        self.pending_counts = defaultdict(int)
-
-        # Derived:
-        assert total_expert_count % ep_group_size == 0, \
-            "total_expert_count must be divisible by ep_group_size"
-        self.queues_per_worker = total_expert_count // ep_group_size
-
-        self._router_device = torch.device("cpu")
-        self._router_dtype = torch.float32
-
-    def enqueue(self, token: Token):
-        """
-        Schedule attention + routing for a single token by enqueuing it into
-        the per-GPU attention queue for the token's home GPU.
-        """
-        home_gpu = int(token.home_gpu)
-        if home_gpu < 0 or home_gpu >= len(self.expert_workers):
-            raise RuntimeError(
-                f"Token {token.tid} has home_gpu={home_gpu} but there are "
-                f"{len(self.expert_workers)} GPU workers."
-            )
-        self.expert_workers[home_gpu].enqueue_attention(self, token)
-
-    def notify_expert_completion(self, token: Token):
-        """
-        Called by the previous layer's experts as each replica finishes.
-        We release the token to the ready queue only after every replica returns.
-        """
-        if self.layer_idx == 0:
-            raise RuntimeError("Layer 0 attention should not receive expert completions.")
-
-        prev_layer = self.layer_idx - 1
-        expected = token.layer_fanout.get(prev_layer)
-        if expected is None or expected <= 0:
-            raise RuntimeError(
-                f"Token {token.tid} missing fanout metadata for layer {prev_layer}"
-            )
-
-        key = token.tid
-        current = self.pending_counts[key] + 1
-        if current < expected:
-            self.pending_counts[key] = current
-            self.pending_tokens.setdefault(key, token)
-            return
-
-        if current == expected:
-            self.pending_counts.pop(key, None)
-            pending_token = self.pending_tokens.pop(key, token)
-            self.enqueue(pending_token)
-            return
-
-        raise RuntimeError(
-            f"Token {token.tid} received {current} completions at layer {self.layer_idx} "
-            f"but only {expected} were expected."
-        )
-
-    def route_and_dispatch(self, token: Token):
-        """
-        Routing + network delay + expert enqueue after attention compute.
-
-        Attention compute time itself is modeled by the GPU worker that popped
-        this token from its per-GPU attention queue. This method is scheduled
-        asynchronously so GPU compute can overlap with network transfer.
-        """
-        # Decide routing for all top-k experts
-        global_expert_ids = self._route_token(token)
-        fanout = len(global_expert_ids)
-        if fanout == 0:
-            raise RuntimeError(f"Router returned no experts for token {token.tid}")
-        token.layer_fanout[self.layer_idx] = fanout
-
-        routes: List[tuple[int, int]] = []
-        dest_workers: set[int] = set()
-        for global_expert_id in global_expert_ids:
-            worker_idx = global_expert_id // self.queues_per_worker
-            local_queue_idx = global_expert_id % self.queues_per_worker
-            routes.append((worker_idx, local_queue_idx))
-            dest_workers.add(worker_idx)
-
-        # Network delay to expert queues. With congestion-aware simulation,
-        # each destination worker's ingress port fair-shares bandwidth among
-        # concurrent senders. We fire one transfer per unique destination
-        # worker and wait for all to complete concurrently.
-        if self.ingress_ports is not None and self.net_delay_fn is not None:
-            transfer_events = []
-            for worker_idx in dest_workers:
-                solo_delay = float(
-                    self.net_delay_fn(int(token.home_gpu), int(worker_idx), 1)
-                )
-                if solo_delay > 0:
-                    transfer_events.append(
-                        self.ingress_ports[worker_idx].transfer(int(token.home_gpu), solo_delay)
-                    )
-
-            if transfer_events:
-                yield simpy.events.AllOf(self.env, transfer_events)
-        else:
-            delay = self.net_t_attn_to_expert
+        self.gpu_idx = gpu_idx
+        self.n_gpu_per_host = n_gpu_per_host
+        self._nvlink = simpy.Resource(env, capacity=1)
+        self._rdma = simpy.Resource(env, capacity=1)
+        self.wait_stats = wait_stats
+        self.observer = observer
+
+    def transfer(self, src_gpu, solo_delay):
+        if not math.isfinite(solo_delay) or solo_delay < 0:
+            raise ValueError("network delay must be finite and nonnegative")
+        if src_gpu == self.gpu_idx or solo_delay == 0:
+            return self.env.timeout(0)
+        intra = src_gpu // self.n_gpu_per_host == self.gpu_idx // self.n_gpu_per_host
+        return self.env.process(self._transfer(self._nvlink if intra else self._rdma, solo_delay))
+
+    def _transfer(self, resource, delay):
+        start = self.env.now
+        with resource.request() as request:
+            yield request
+            if self.wait_stats is not None:
+                self.wait_stats.add(self.env.now - start)
+            if self.observer is not None:
+                self.observer.metric(self.env.now, "network_receive_wait", [self.env.now - start])
             yield self.env.timeout(delay)
 
-        # Send token copies into each chosen expert queue in THIS layer
-        for worker_idx, local_queue_idx in routes:
-            expert_worker = self.expert_workers[worker_idx]
-            expert_worker.enqueue(self.layer_idx, local_queue_idx, token)
 
-    def _route_token(self, token: Token) -> List[int]:
-        """Return the list of expert ids selected by the profile-driven router."""
-        token_indices = torch.tensor(
-            [token.token_index],
-            device=self._router_device,
-            dtype=torch.int64,
+class GPUWorker:
+    """One non-preemptive compute resource, with per-stage/per-layer queues."""
+    def __init__(self, sim, rank):
+        self.sim, self.env, self.rank = sim, sim.env, rank
+        self.queue_trace = getattr(sim, "queue_trace", None)
+        self.token_trace = getattr(sim, "token_trace", None)
+        self.observer = getattr(sim, "observer", None)
+        self.attention = [deque() for _ in range(sim.num_layers + 1)]
+        self.experts = [[deque() for _ in range(sim.experts_per_gpu)] for _ in range(sim.num_layers)]
+        self._ready_expert_queues = set()
+        self._expert_queues_initialized = False
+        self.expert_scheduling = getattr(sim, "expert_scheduling", "layer")
+        scheduler_type = ExpertWiseScheduler if self.expert_scheduling == "expert" else UnifiedScheduler
+        scheduler_options = ({"experts_per_layer": sim.experts_per_gpu}
+                             if self.expert_scheduling == "expert" else {})
+        self.scheduler = scheduler_type(
+            sim.num_layers, sim.top_k, sim.policy,
+            sim.lookahead_steps, sim.lookback_steps, sim.weight_decay,
+            **scheduler_options,
         )
-        _, topk_ids = self.profile_router.route(
-            request_ids=[token.request_id],
-            token_indices=token_indices,
-            layer_id=self.layer_idx,
-            top_k=self.profile_router.top_k,
-            device=self._router_device,
-            dtype=self._router_dtype,
+        self.wakeup = self.env.event()
+        self.busy_time = 0.0
+        self.busy_by_stage = Counter()
+        self.overhead_batch_counts = Counter()
+        self.overhead_scheduled_ticks = defaultdict(Counter)
+        self.overhead_workload_counts = defaultdict(Counter)
+        self.current_compute = None
+        self.attention_batches = Counter()
+        self.finalize_batches = Counter()
+        self.expert_batches = Counter()
+        self.expert_individual_batches = Counter()
+        self.process = self.env.process(self.run())
+
+    def wake(self):
+        if not self.wakeup.triggered:
+            self.wakeup.succeed()
+
+    def enqueue_attention(self, layer, token):
+        self.attention[layer].append((token, self.env.now))
+        if self.queue_trace is not None:
+            self.queue_trace.change(self.env.now, self.rank, layer, 1)
+        self.sim.ready_attention += 1
+        self.sim.peak_ready_attention = max(self.sim.peak_ready_attention, self.sim.ready_attention)
+        self.wake()
+
+    def enqueue_expert(self, branch):
+        local = branch.expert_id % self.sim.experts_per_gpu
+        self.experts[branch.layer][local].append((branch, self.env.now))
+        self._ready_expert_queues.add((branch.layer, local))
+        if self.queue_trace is not None:
+            self.queue_trace.change(self.env.now, self.rank, self.sim.num_layers + 1 + branch.layer, 1)
+        self.sim.ready_expert += 1
+        self.sim.peak_ready_expert = max(self.sim.peak_ready_expert, self.sim.ready_expert)
+        if self.token_trace is not None and self.token_trace.pending:
+            self.token_trace.expert_ready(branch, self.env.now)
+        self.wake()
+
+    def snapshot(self):
+        """Layer aggregates for occupancy metrics, independent of scheduling granularity."""
+        attn = [len(q) for q in self.attention]
+        expert = [sum(len(q) for q in queues) for queues in self.experts]
+        oldest = [q[0][1] if q else math.inf for q in self.attention]
+        oldest += [min((q[0][1] for q in queues if q), default=math.inf) for queues in self.experts]
+        return attn, expert, oldest
+
+    def run(self):
+        while True:
+            if self.expert_scheduling == "expert":
+                # Initialize once to also support directly preloaded test queues.
+                # Afterwards enqueue/dequeue maintain this set without scanning
+                # every empty expert queue on every GPU dispatch.
+                if not self._expert_queues_initialized:
+                    self._ready_expert_queues.update(
+                        (layer, expert) for layer, queues in enumerate(self.experts)
+                        for expert, queue in enumerate(queues) if queue)
+                    self._expert_queues_initialized = True
+                attn = [len(q) for q in self.attention]
+                expert = [(layer, local, len(self.experts[layer][local]))
+                          for layer, local in sorted(self._ready_expert_queues)]
+                oldest = None
+                if self.scheduler.policy == "fifo":
+                    oldest = [q[0][1] if q else math.inf for q in self.attention]
+                    oldest += [self.experts[layer][local][0][1] for layer, local, _ in expert]
+                decision = self.scheduler.select_sparse(attn, expert, oldest, record_details=False)
+            else:
+                attn = [len(q) for q in self.attention]
+                expert = [sum(len(q) for q in queues) for queues in self.experts]
+                oldest = self.snapshot()[2] if self.scheduler.policy == "fifo" else None
+                decision = self.scheduler.select(attn, expert, oldest)
+            if decision is None:
+                self.wakeup = self.env.event()
+                yield self.wakeup
+                continue
+            stage, layer = decision[:2]
+            local_expert = decision[2] if self.expert_scheduling == "expert" else None
+            started = float(self.env.now)
+            loads = None
+            attention_estimate = None
+            if stage == "attention":
+                queue = self.attention[layer]
+                items = [queue.popleft() for _ in range(min(len(queue), self.sim.attn_batch_cap))]
+                tokens = [item[0] for item in items]
+                if self.queue_trace is not None:
+                    self.queue_trace.change(self.env.now, self.rank, layer, -len(tokens))
+                self.sim.ready_attention -= len(tokens)
+                for token, ready_at in items:
+                    wait = started - ready_at
+                    if layer == self.sim.num_layers:
+                        self.sim.stats["finalize_ready_wait"].add(wait)
+                        token.finalize_ready_wait += wait
+                    else:
+                        self.sim.stats["attention_ready_wait"].add(wait)
+                        token.attention_ready_wait += wait
+                if self.observer is not None:
+                    name = "finalize_ready_wait" if layer == self.sim.num_layers else "attention_ready_wait"
+                    self.observer.metric(self.env.now, name, (started - ready_at for _, ready_at in items))
+                contexts = [self.sim.initial_context + token.token_index for token in tokens]
+                if layer == self.sim.num_layers:
+                    duration = len(tokens) * self.sim.finalize_t
+                else:
+                    attention_estimate = self.sim.attention_cost.evaluate(contexts)
+                    duration = attention_estimate.total_ticks
+                batch_size = len(tokens)
+                (self.finalize_batches if layer == self.sim.num_layers else self.attention_batches)[batch_size] += 1
+            else:
+                queues = self.experts[layer]
+                items, loads = [], [0] * len(queues)
+                if local_expert is not None:
+                    queue = queues[local_expert]
+                    count = min(len(queue), self.sim.expert_batch_cap)
+                    items = [queue.popleft() for _ in range(count)]
+                    loads[local_expert] = count
+                    if not queue:
+                        self._ready_expert_queues.discard((layer, local_expert))
+                else:
+                    # Merge group queue heads by ready time. Low expert IDs
+                    # must not displace older branches when the group cap hits.
+                    heads = [(queue[0][1], index) for index, queue in enumerate(queues) if queue]
+                    heapq.heapify(heads)
+                    while heads and len(items) < self.sim.expert_batch_cap:
+                        _, index = heapq.heappop(heads)
+                        queue = queues[index]
+                        items.append(queue.popleft())
+                        loads[index] += 1
+                        if queue:
+                            heapq.heappush(heads, (queue[0][1], index))
+                for take in loads:
+                    if take:
+                        self.expert_individual_batches[take] += 1
+                branches = [item[0] for item in items]
+                if self.queue_trace is not None:
+                    self.queue_trace.change(self.env.now, self.rank, self.sim.num_layers + 1 + layer, -len(branches))
+                self.sim.ready_expert -= len(branches)
+                for branch, ready_at in items:
+                    wait = started - ready_at
+                    self.sim.stats["expert_ready_wait"].add(wait)
+                    branch.token.expert_ready_wait += wait
+                if self.observer is not None:
+                    self.observer.metric(self.env.now, "expert_ready_wait", (started - ready_at for _, ready_at in items))
+                duration = self.sim.expert_cost(loads)
+                batch_size = len(branches)
+                self.expert_batches[batch_size] += 1
+            if not math.isfinite(duration) or duration < 0:
+                raise ValueError("compute cost must be finite and nonnegative")
+            compute_stage = "finalize" if layer == self.sim.num_layers else stage
+            service = self.batch_service(compute_stage, duration, batch_size,
+                                         items=items, candidate_queues=len(attn) + len(expert))
+            duration = service.total_ticks
+            trace = {
+                "gpu": self.rank, "stage": compute_stage,
+                "layer": layer, "start": started, "end": started + duration,
+                "batch_size": batch_size, "expert_counts": loads,
+                "expert_scheduling": self.expert_scheduling,
+                "local_expert_id": local_expert,
+                "expert_id": (self.rank * self.sim.experts_per_gpu + local_expert
+                              if local_expert is not None else None),
+                "selected_queue_index": self.scheduler.last_selected_index,
+            }
+            self.add_overhead_trace(trace, service)
+            if attention_estimate is not None:
+                # Planned cost breakdown, not a measured sub-kernel timeline.
+                trace["attention_context_mean"] = attention_estimate.context_mean
+                trace["attention_components_ticks"] = attention_estimate.components_ticks
+            capture_details = getattr(self.sim, "should_capture_schedule_details", None)
+            if capture_details is None or capture_details(started, started + duration):
+                if self.expert_scheduling == "expert":
+                    self.scheduler.materialize_details()
+                trace["queue_snapshot"] = self.scheduler.last_snapshot[:]
+                trace["scores"] = self.scheduler.last_scores[:]
+            self.sim.capture_schedule(trace)
+            token_trace = getattr(self, "token_trace", None)
+            token_trace_batch_id = (token_trace.batch_selected(trace, items)
+                                    if token_trace is not None else None)
+            yield from self.execute_service(compute_stage, service, token_trace_batch_id)
+            if token_trace is not None:
+                token_trace.batch_completed(token_trace_batch_id, self.env.now)
+            if getattr(self.sim, "track_fragments", False):
+                self.sim.mark_batch_output(compute_stage, items)
+            if stage == "attention":
+                if layer == self.sim.num_layers:
+                    for token in tokens:
+                        self.sim.complete(token)
+                else:
+                    self.sim.dispatch(self.rank, layer, tokens)
+            else:
+                # Return communication is independent of the compute resource.
+                destinations = defaultdict(list)
+                for branch in branches:
+                    destinations[branch.token.home_gpu].append(branch)
+                for dst, outgoing in destinations.items():
+                    self.sim.send(self.rank, dst, outgoing, returning=True)
+
+    def batch_workload(self, stage, items, candidate_queues):
+        """Count selected source-row spans, without materializing activation tensors.
+
+        Forward payload rows are ordered by expert. Return payloads contain
+        the newly produced expert outputs. A capped selection can therefore
+        retain one contiguous slice or require gathering several disjoint ones.
+        This is logical buffer provenance, not a physical allocator model.
+        """
+        if stage == "expert":
+            refs = [(branch.buffer_id, branch.buffer_row) for branch, _ in items]
+        else:
+            refs = [ref for token, _ in items for ref in token.reformation_inputs]
+        if not refs or any(buffer is None for buffer, _ in refs):
+            raise RuntimeError("structural overhead requires source-buffer provenance")
+        by_buffer = defaultdict(set)
+        for buffer, row in refs:
+            by_buffer[buffer].add(row)
+        if sum(map(len, by_buffer.values())) != len(refs):
+            raise RuntimeError("duplicate source row in selected batch")
+        fragments = 0
+        for rows in by_buffer.values():
+            fragments += sum(row - 1 not in rows for row in rows)
+        contiguous = (stage == "expert" and fragments == 1
+                      and all(refs[i] == (refs[0][0], refs[0][1] + i)
+                              for i in range(len(refs))))
+        return BatchWorkload(input_rows=len(refs), fragments=fragments,
+                             candidate_queues=candidate_queues,
+                             hidden_dim=self.sim.hidden_dim,
+                             bytes_per_element=self.sim.bytes_per_element,
+                             contiguous=contiguous)
+
+    def batch_service(self, stage, duration, batch_size, *, items=None, candidate_queues=1):
+        model = getattr(self.sim, "overhead_model", None)
+        if model is None or not model.enabled:
+            return BatchOverheadEstimate(duration)
+        workload = None
+        if model.preset == "structural" and stage != "finalize" and batch_size:
+            workload = self.batch_workload(stage, items, candidate_queues)
+        estimate = model.evaluate(stage, duration, batch_size=batch_size, workload=workload)
+        if stage != "finalize" and batch_size:
+            self.overhead_batch_counts[stage] += 1
+            for name, value in estimate.as_dict().items():
+                self.overhead_scheduled_ticks[stage][name] += value
+            if estimate.details is not None:
+                features = estimate.details["workload"]
+                counts = self.overhead_workload_counts[stage]
+                counts["output_rows"] += batch_size
+                for key in ("input_rows", "fragments", "candidate_queues",
+                            "read_bytes", "write_bytes", "traffic_bytes"):
+                    counts[key] += features[key]
+                counts["fast_path_batches"] += int(estimate.details["components"]["fast_path"])
+                counts["executed_traffic_bytes"] += estimate.details["components"]["executed_traffic_bytes"]
+        return estimate
+
+    def overhead_accounting(self):
+        result = {"batch_counts": dict(self.overhead_batch_counts),
+                  "by_stage_ticks": {stage: dict(values) for stage, values
+                                     in self.overhead_scheduled_ticks.items()}}
+        if self.sim.overhead_model.preset == "structural":
+            result["by_stage_workload"] = {stage: dict(values) for stage, values
+                                          in self.overhead_workload_counts.items()}
+        return result
+
+    def add_overhead_trace(self, trace, service):
+        model = getattr(self.sim, "overhead_model", None)
+        if model is not None and model.enabled:
+            # start/end retain the complete reserved batch service interval.
+            trace["batch_overhead"] = service.as_dict()
+            trace["gpu_start"] = trace["start"] + service.cpu_exposed_ticks
+            trace["compute_start"] = trace["gpu_start"] + service.reformation_exposed_ticks
+            trace["compute_end"] = trace["end"]
+            if service.details is not None:
+                trace["batch_workload"] = service.details["workload"]
+                trace["batch_overhead_components"] = service.details["components"]
+
+    def execute_service(self, stage, service, token_trace_batch_id=None):
+        # A fixed exposure assumption, not a simulated host thread. The batch
+        # has already been reserved; arrivals during this gap cannot join it.
+        if service.cpu_exposed_ticks > 0:
+            yield self.env.timeout(service.cpu_exposed_ticks)
+        self.current_compute = (stage, float(self.env.now), service.gpu_ticks)
+        token_trace = getattr(self, "token_trace", None)
+        if token_trace is not None:
+            token_trace.batch_gpu_started(token_trace_batch_id, self.env.now)
+        # Preserve the original single event, including zero compute, when off.
+        yield self.env.timeout(service.gpu_ticks)
+        self.busy_time += service.gpu_ticks
+        self.busy_by_stage[stage] += service.gpu_ticks
+        self.current_compute = None
+
+    def observed_busy(self):
+        busy = self.busy_time
+        stages = dict(self.busy_by_stage)
+        if self.current_compute is not None:
+            stage, start, duration = self.current_compute
+            elapsed = max(0.0, min(duration, self.env.now - start))
+            busy += elapsed
+            stages[stage] = stages.get(stage, 0.0) + elapsed
+        return busy, stages
+
+
+class AsyncMoESimulator:
+    worker_type = GPUWorker
+
+    def __init__(self, *, settings, router, expert_cost, attention_cost):
+        for name, value in settings.items():
+            setattr(self, name, value)
+        self.env = simpy.Environment()
+        self.router, self.expert_cost, self.attention_cost = router, expert_cost, attention_cost
+        self.overhead_model = BatchOverheadModel(
+            ticks_per_millisecond=self.ticks_per_ms,
+            **(getattr(self, "overhead_config", None) or {}))
+        self.hidden_dim = getattr(self, "hidden_dim", 2048)
+        self.bytes_per_element = getattr(self, "bytes_per_element", 2)
+        self.track_fragments = self.overhead_model.preset == "structural"
+        self.next_buffer_id = 0
+        self.next_output_batch_id = 0
+        self.expert_scheduling = getattr(self, "expert_scheduling", "layer")
+        if self.expert_scheduling not in ("layer", "expert"):
+            raise ValueError("expert_scheduling must be 'layer' or 'expert'")
+        _validate_workload_overrides(self)
+        self.observer = getattr(self, "observer", None)
+        self.experts_per_gpu = self.num_experts // self.num_gpus
+        self.queue_trace = None
+        self.token_trace = None
+        self.stats = {name: Samples(self.metric_sample_cap, self.seed + i) for i, name in enumerate((
+            "attention_ready_wait", "expert_ready_wait", "finalize_ready_wait", "join_wait", "network_receive_wait",
+            "admission_wait", "token_latency", "itl", "request_latency",
+        ))}
+        self.ports = [IngressPort(self.env, rank, self.gpus_per_host, self.stats["network_receive_wait"], self.observer)
+                      for rank in range(self.num_gpus)]
+        self.workers = [self.worker_type(self, rank) for rank in range(self.num_gpus)]
+        self.requests = {}  # rid -> (arrival, home GPU, next token index)
+        self.waiting = deque()
+        self.joins = {}
+        self.next_tid = 0
+        self.next_home = 0
+        self.completed_requests = 0
+        self.completed_tokens = 0
+        self.completion_times = {}
+        self.schedule_trace = []
+        self.schedule_count = 0
+        self.last_debug = None
+        self.saturation_time = None
+        self.saturation_tokens = None
+        self.saturation_step = None
+        self.steps = 0
+        self.arrived_requests = 0
+        self.ready_attention = self.ready_expert = 0
+        self.peak_ready_attention = self.peak_ready_expert = 0
+        self.peak_active = self.peak_waiting = self.peak_joins = 0
+        self.inflight_branches = self.peak_inflight_branches = 0
+        self.remote_transfers = self.remote_copies = 0
+        self.env.process(self.source())
+        # Open artifact files only after simulator construction can no longer fail.
+        # No SimPy process runs until run(), so all queue hooks are still at zero.
+        if getattr(self, "queue_trace_path", None) is not None:
+            self.queue_trace = QueueTraceRecorder(
+                self.queue_trace_path, num_gpus=self.num_gpus, num_layers=self.num_layers,
+                ticks_per_millisecond=self.ticks_per_ms,
+                interval_ms=self.queue_trace_interval_ms, start_ms=self.queue_trace_start_ms,
+                end_ms=self.queue_trace_end_ms, policy=self.policy, top_k=self.top_k,
+                configuration={key: getattr(self, key) for key in (
+                    "num_gpus", "num_experts", "num_layers", "expert_batch_cap", "attn_batch_cap", "expert_scheduling",
+                    "total_requests", "tokens_per_request", "arrival_rate", "active_cap",
+                    "initial_context", "finalize_t", "dispatch_t", "return_t", "gpus_per_host",
+                    "seed", "lookahead_steps", "lookback_steps", "weight_decay", "stop_after")})
+            for worker in self.workers:
+                worker.queue_trace = self.queue_trace
+            self.queue_trace.configuration["batch_overhead_model"] = self.overhead_model.describe()
+        try:
+            if getattr(self, "token_trace_path", None) is not None:
+                if getattr(self, "execution_mode", "async") != "async":
+                    raise ValueError("token tracing supports execution_mode='async' only")
+                self.token_trace = TokenTraceRecorder(
+                    self.token_trace_path, num_layers=self.num_layers,
+                    ticks_per_millisecond=self.ticks_per_ms,
+                    start_ms=getattr(self, "token_trace_start_ms", 0.0),
+                    end_ms=getattr(self, "token_trace_end_ms", None),
+                    configuration={key: getattr(self, key) for key in (
+                        "num_gpus", "num_experts", "num_layers", "top_k", "expert_batch_cap",
+                        "attn_batch_cap", "expert_scheduling", "policy", "active_cap", "seed")})
+                self.token_trace.configuration["batch_overhead_model"] = self.overhead_model.describe()
+                for worker in self.workers:
+                    worker.token_trace = self.token_trace
+            if self.observer is not None:
+                self.observer.bind(self)
+        except Exception:
+            if self.queue_trace is not None:
+                self.queue_trace.close()
+            if self.token_trace is not None:
+                self.token_trace.close(self.env.now, reason="simulator_initialization_failed")
+            raise
+
+    def source(self):
+        rng = random.Random(self.seed)
+        for rid in range(self.total_requests):
+            if self.arrival_times_ms is not None:
+                delay = self.arrival_times_ms[rid] * self.ticks_per_ms - self.env.now
+                if rid or delay > 0:
+                    yield self.env.timeout(delay)
+            elif rid:
+                yield self.env.timeout(rng.expovariate(self.arrival_rate) if self.arrival_rate > 0 else 0)
+            self.arrived_requests += 1
+            self.waiting.append((rid, float(self.env.now)))
+            if self.observer is not None:
+                self.observer.arrived(self, rid)
+            self.admit()
+            self.peak_waiting = max(self.peak_waiting, len(self.waiting))
+
+    def admit(self):
+        while self.waiting and len(self.requests) < self.active_cap:
+            rid, arrival = self.waiting.popleft()
+            home = self.next_home % self.num_gpus
+            self.next_home += 1
+            self.requests[rid] = (arrival, home, 0)
+            if self.observer is not None:
+                self.observer.admitted(self, rid, home, arrival)
+            self.stats["admission_wait"].add(self.env.now - arrival)
+            self.peak_active = max(self.peak_active, len(self.requests))
+            if self.saturation_time is None and len(self.requests) >= self.active_cap:
+                self.saturation_time = float(self.env.now)
+                self.saturation_tokens = self.completed_tokens
+                self.saturation_step = self.steps
+            self.spawn_token(rid)
+
+    def spawn_token(self, rid):
+        arrival, home, index = self.requests[rid]
+        token = Token(self.next_tid, float(self.env.now), rid, index, home)
+        if self.track_fragments:
+            # Independent decode admissions have independent input rows. This
+            # assumption deliberately does not reconstruct tokenizer batching.
+            token.reformation_inputs = ((-token.tid - 1, 0),)
+        if index > 0:
+            token.previous_completion_time = float(self.env.now)
+        self.next_tid += 1
+        self.requests[rid] = (arrival, home, index + 1)
+        if self.begin_cb is not None:
+            self.begin_cb(token)
+        self.workers[home].enqueue_attention(0, token)
+
+    def dispatch(self, src, layer, tokens):
+        _, ids = self.router.route(
+            request_ids=([t.request_id for t in tokens] if self.routing_request_indices is None else
+                         [self.routing_request_indices[t.request_id] for t in tokens]),
+            token_indices=[t.token_index for t in tokens], layer_id=layer,
+            top_k=self.top_k, device=torch.device("cpu"), dtype=torch.float32,
         )
-        topk_ids_cpu = topk_ids[0].to("cpu").tolist()
-        selected = [int(expert_id) for expert_id in topk_ids_cpu if expert_id >= 0]
-        if not selected:
-            raise RuntimeError(
-                f"Profile returned only placeholder expert ids for token {token.tid} at layer {self.layer_idx}"
-            )
-        return selected
+        destinations = defaultdict(list)
+        for token, expert_ids in zip(tokens, ids.tolist()):
+            selected = [eid for eid in expert_ids if eid >= 0]
+            if not selected or len(set(selected)) != len(selected):
+                raise ValueError("routing must select nonempty, distinct expert IDs")
+            token.layer_fanout[layer] = len(selected)
+            self.joins[(token.tid, layer)] = Join(token, set(selected))
+            if self.token_trace is not None and self.token_trace.pending:
+                self.token_trace.routed(token, layer, selected, self.experts_per_gpu, self.env.now)
+            for eid in selected:
+                destinations[eid // self.experts_per_gpu].append(Branch(token, eid, layer))
+        self.peak_joins = max(self.peak_joins, len(self.joins))
+        for dst, branches in destinations.items():
+            self.send(src, dst, branches, returning=False)
 
+    def send(self, src, dst, branches, returning):
+        self.inflight_branches += len(branches)
+        self.peak_inflight_branches = max(self.peak_inflight_branches, self.inflight_branches)
+        if src != dst:
+            self.remote_transfers += 1
+            self.remote_copies += len(branches)
+        self.env.process(self._deliver(src, dst, branches, returning))
 
-# ------------------------------
-# Request source
-# ------------------------------
+    def mark_batch_output(self, stage, items):
+        if self.track_fragments and stage != "finalize":
+            batch_id = self.next_output_batch_id
+            self.next_output_batch_id += 1
+            for item, _ in items:
+                item.output_batch_id = batch_id
 
-def request_source(env,
-                   total_requests: int,
-                   arrival_rate: float,
-                   request_manager: RequestManager):
-    """
-    Poisson arrival process with rate `arrival_rate` over requests.
-    Each arriving request immediately dispatches token 0; subsequent tokens
-    are sent only after the previous token completes.
-    """
-    for rid in range(total_requests):
-        request_manager.admit_request(rid, arrival_time=env.now)
+    def _deliver(self, src, dst, branches, returning):
+        if self.track_fragments:
+            # A collective may coalesce several capped compute batches into
+            # one transfer. Coalescing messages must not silently turn their
+            # distinct source tensors into one contiguous buffer for free.
+            producers = defaultdict(list)
+            for branch in branches:
+                producer = branch if returning else branch.token
+                if producer.output_batch_id is None:
+                    raise RuntimeError("structural transfer requires producing-batch provenance")
+                producers[producer.output_batch_id].append(branch)
+            for group in producers.values():
+                buffer_id = self.next_buffer_id
+                self.next_buffer_id += 1
+                rows = group if returning else sorted(group, key=lambda branch: branch.expert_id)
+                for row, branch in enumerate(rows):
+                    branch.buffer_id, branch.buffer_row = buffer_id, row
+        if src == dst:
+            delay = 0.0
+        elif self.net_delay_fn is not None:
+            delay = float(self.net_delay_fn(src, dst, len(branches)))
+        else:
+            delay = self.return_t if returning else self.dispatch_t
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError("network delay must be finite and nonnegative")
+        if self.net_delay_fn is not None:
+            yield self.ports[dst].transfer(src, delay)
+        else:
+            yield self.env.timeout(delay)
+        self.inflight_branches -= len(branches)
+        # Each destination is released independently; there is no fanout barrier.
+        for branch in branches:
+            if returning:
+                self.join(branch)
+            else:
+                self.workers[dst].enqueue_expert(branch)
 
-        if rid < total_requests - 1:
-            # Poisson arrivals => Exp(lambda) inter-arrival
-            inter_arrival = random.expovariate(arrival_rate)
-            yield env.timeout(inter_arrival)
+    def join(self, branch):
+        key = (branch.token.tid, branch.layer)
+        state = self.joins.get(key)
+        if state is None or branch.expert_id not in state.remaining:
+            raise RuntimeError(f"duplicate or unexpected expert completion: {key}, {branch.expert_id}")
+        if self.token_trace is not None and self.token_trace.pending:
+            self.token_trace.returned(branch, self.env.now)
+        state.remaining.remove(branch.expert_id)
+        if self.track_fragments:
+            state.input_rows.append((branch.buffer_id, branch.buffer_row))
+        if state.first_return is None:
+            state.first_return = float(self.env.now)
+        if not state.remaining:
+            wait = self.env.now - state.first_return
+            self.stats["join_wait"].add(wait)
+            if self.observer is not None:
+                self.observer.metric(self.env.now, "join_wait", [wait])
+            state.token.join_wait += wait
+            del self.joins[key]
+            if self.token_trace is not None and self.token_trace.pending:
+                self.token_trace.joined(state.token, branch.layer, self.env.now)
+            if self.track_fragments:
+                state.token.reformation_inputs = tuple(state.input_rows)
+            self.workers[state.token.home_gpu].enqueue_attention(branch.layer + 1, state.token)
 
+    def complete(self, token):
+        now = float(self.env.now)
+        if token.tid in self.completion_times:
+            raise RuntimeError("token completed twice")
+        self.completion_times[token.tid] = now
+        self.completed_tokens += 1
+        if self.observer is not None:
+            self.observer.token_completed(self, token)
+        self.stats["token_latency"].add(now - token.birth_time)
+        if token.token_index > 0:
+            self.stats["itl"].add(now - token.birth_time)
+        if self.stats_cb is not None and token.sampled_for_stats:
+            self.stats_cb(token, now)
+        arrival, _, _ = self.requests[token.request_id]
+        if token.token_index + 1 == self.tokens_per_request:
+            self.completed_requests += 1
+            if self.observer is not None:
+                self.observer.request_completed(self, token.request_id)
+            self.stats["request_latency"].add(now - arrival)
+            del self.requests[token.request_id]
+            self.admit()
+        else:
+            self.spawn_token(token.request_id)
 
-# ------------------------------
-# Main simulation driver
-# ------------------------------
+    def should_capture_schedule_details(self, start, end):
+        return (len(self.schedule_trace) < self.trace_limit
+                or (self.debug and self.saturation_time is not None)
+                or (self.observer is not None and getattr(self.observer, "needs_schedule_details", True))
+                or (self.queue_trace is not None and self.queue_trace.observes_schedule(start, end)))
+
+    def capture_schedule(self, trace):
+        self.schedule_count += 1
+        if self.observer is not None:
+            self.observer.scheduled(trace)
+        if self.queue_trace is not None:
+            self.queue_trace.capture_schedule(trace)
+        if len(self.schedule_trace) < self.trace_limit:
+            self.schedule_trace.append(trace)
+        if self.debug and self.saturation_time is not None:
+            self.last_debug = trace
+
+    def run(self):
+        expected = self.total_requests * self.tokens_per_request
+        while self.env.peek() < math.inf:
+            if self.completed_tokens == expected:
+                break
+            if (self.stop_after is not None and self.saturation_time is not None
+                    and self.completed_tokens - self.saturation_tokens >= self.stop_after):
+                break
+            if self.observer is not None:
+                self.observer.advance(self, self.env.peek())
+            self.env.step()
+            self.steps += 1
+        stopped = self.completed_tokens != expected
+        if stopped and (self.stop_after is None or self.saturation_time is None):
+            raise RuntimeError("event queue drained with unfinished requests")
+        makespan = float(self.env.now)
+        seconds = makespan / self.ticks_per_ms / 1000
+        measures = {name: samples.summary(1 / self.ticks_per_ms) for name, samples in self.stats.items()}
+        busy = [worker.observed_busy() for worker in self.workers]
+        attn_hist, expert_hist, individual_hist, final_hist = Counter(), Counter(), Counter(), Counter()
+        for worker in self.workers:
+            attn_hist.update(worker.attention_batches)
+            final_hist.update(worker.finalize_batches)
+            expert_hist.update(worker.expert_batches)
+            individual_hist.update(worker.expert_individual_batches)
+        hist_mean = lambda hist: sum(k * n for k, n in hist.items()) / sum(hist.values()) if hist else 0.0
+        tail_seconds = ((makespan - self.saturation_time) / self.ticks_per_ms / 1000
+                        if self.saturation_time is not None else 0.0)
+        unfinished_ready_ages = []
+        for worker in self.workers:
+            a, e, oldest = worker.snapshot()
+            unfinished_ready_ages.extend(makespan - time for count, time in zip(a + e, oldest) if count)
+        result = {
+            "completion_times": self.completion_times,
+            "avg_latency": self.stats["token_latency"].total / self.completed_tokens if self.completed_tokens else 0.0,
+            "makespan": makespan, "makespan_ms": makespan / self.ticks_per_ms,
+            "completed_tokens": self.completed_tokens, "completed_requests": self.completed_requests,
+            "output_tokens_per_sec": self.completed_tokens / seconds if seconds else 0.0,
+            "completed_requests_per_sec": self.completed_requests / seconds if seconds else 0.0,
+            "avg_throughput_req_per_sec": self.completed_tokens / self.tokens_per_request / seconds if seconds else 0.0,
+            "tail_throughput_req_per_sec": ((self.completed_tokens - self.saturation_tokens)
+                / self.tokens_per_request / tail_seconds if tail_seconds else float("nan")),
+            "avg_request_latency_ms": measures["request_latency"]["mean"] if self.completed_requests else float("nan"),
+            "p90_request_latency_ms": measures["request_latency"]["p90"] if self.completed_requests else float("nan"),
+            "p99_request_latency_ms": measures["request_latency"]["p99"] if self.completed_requests else float("nan"),
+            "avg_per_expert_batch_size": hist_mean(individual_hist),
+            "avg_expert_group_batch_size": hist_mean(expert_hist),
+            "avg_attention_batch_size": hist_mean(attn_hist),
+            "attention_batch_histogram": dict(attn_hist),
+            "finalize_batch_histogram": dict(final_hist),
+            "expert_group_batch_histogram": dict(expert_hist),
+            "per_expert_batch_histogram": dict(individual_hist),
+            "metrics_ms": measures,
+            "gpu_compute_busy_fraction": [b / makespan if makespan else 0.0 for b, _ in busy],
+            "gpu_compute_busy_ticks": [b for b, _ in busy],
+            "gpu_stage_busy_ticks": [s for _, s in busy],
+            "batch_overhead_model": self.overhead_model.describe(),
+            "batch_overhead_accounting": {
+                "scope": "sum of scheduled local batch estimates, including unfinished batches at early stop; not wall-time or observed CPU utilization",
+                "by_gpu": [worker.overhead_accounting() for worker in self.workers],
+            },
+            "active_requests_at_end": len(self.requests), "waiting_requests_at_end": len(self.waiting),
+            "unarrived_requests_at_end": self.total_requests - self.arrived_requests,
+            "inflight_tokens_at_end": self.next_tid - self.completed_tokens,
+            "incomplete_joins_at_end": len(self.joins),
+            "inflight_network_branches_at_end": self.inflight_branches,
+            "ready_attention_at_end": self.ready_attention, "ready_expert_at_end": self.ready_expert,
+            "peak_active_requests": self.peak_active, "peak_waiting_requests": self.peak_waiting,
+            "peak_incomplete_joins": self.peak_joins, "peak_network_branches": self.peak_inflight_branches,
+            "peak_ready_attention": self.peak_ready_attention, "peak_ready_expert": self.peak_ready_expert,
+            "oldest_ready_age_at_end_ms": max(unfinished_ready_ages, default=0.0) / self.ticks_per_ms,
+            "remote_transfer_count": self.remote_transfers, "remote_expert_copy_count": self.remote_copies,
+            "stopped_early": stopped, "steps_executed": self.steps,
+            "saturation_step": self.saturation_step, "saturation_time": self.saturation_time,
+            "saturation_tokens_completed": self.saturation_tokens,
+            "scheduling_policy": self.policy,
+            "expert_scheduling": self.expert_scheduling,
+            "schedule_trace_layout": {
+                "queue_order": ("A_0..A_L, then E_(layer,local_expert) in layer-major order"
+                                if self.expert_scheduling == "expert" else "A_0..A_L, then E_0..E_(L-1)"),
+                "num_attention_queues": self.num_layers + 1,
+                "experts_per_gpu": self.experts_per_gpu,
+                "expert_id_mapping": "gpu * experts_per_gpu + local_expert_id",
+                "snapshot_units": "attention tokens; expert branches, before selection",
+            },
+            "schedule_trace": self.schedule_trace, "schedule_count": self.schedule_count,
+            "schedule_trace_truncated": self.schedule_count > len(self.schedule_trace),
+            "defrag_v0_debug_triggered": self.debug and self.saturation_time is not None,
+            "defrag_v0_debug_trigger_time": self.saturation_time if self.debug else None,
+            "defrag_v0_debug_logged": self.last_debug is not None,
+            "defrag_v0_debug_entry": self.last_debug,
+            "attention_cost_model": self.attention_cost.describe(),
+            "cost_model": {
+                "expert": "exact_grouped_profile" if self.expert_cost.grouped_lookup is not None else "sum_per_expert_proxy",
+                "expert_scale": self.expert_cost.scale,
+                "attention": self.attention_cost.describe()["kind"],
+                "initial_context_length": self.initial_context,
+                "finalize_per_token_ticks": self.finalize_t,
+                "network": "dual_receive_fifo" if self.net_delay_fn is not None else "fixed_delay_no_contention",
+                "hardware_calibrated": False,
+            },
+        }
+        if self.queue_trace is not None:
+            result["queue_trace"] = self.queue_trace.finish(makespan)
+        if self.observer is not None:
+            result["steady_metrics"] = self.observer.finish(self, fully_drained=not stopped)
+        if self.token_trace is not None:
+            result["token_trace"] = self.token_trace.finish(makespan, fully_drained=not stopped)
+        if not self.quiet:
+            print(f"{self.policy}: completed {self.completed_tokens}/{expected} tokens, "
+                  f"{self.completed_requests}/{self.total_requests} requests, "
+                  f"{result['output_tokens_per_sec']:.3f} tokens/s; "
+                  f"ITL P95={measures['itl']['p95']} ms")
+        return result
+
 
 def run_simulation(
-    ep_group_size=EP_GROUP_SIZE,
-    total_expert_count=TOTAL_EXPERT_COUNT,
-    max_batch_size=MAX_BATCH_SIZE,
-    num_layers=NUM_LAYERS,
-    total_requests=TOTAL_REQUESTS,
-    tokens_per_request=TOKENS_PER_REQUEST,
-    arrival_rate=ARRIVAL_RATE,
-    expert_profile_path=EXPERT_COMPUTE_PROFILE_PATH,
-    profile_routing_path=PROFILE_ROUTING_PATH,
-    routing_top_k=ROUTING_TOP_K,
+    ep_group_size=EP_GROUP_SIZE, total_expert_count=TOTAL_EXPERT_COUNT,
+    max_batch_size=MAX_BATCH_SIZE, num_layers=NUM_LAYERS,
+    total_requests=TOTAL_REQUESTS, tokens_per_request=TOKENS_PER_REQUEST,
+    arrival_rate=ARRIVAL_RATE, expert_profile_path=EXPERT_COMPUTE_PROFILE_PATH,
+    profile_routing_path=PROFILE_ROUTING_PATH, routing_top_k=ROUTING_TOP_K,
     global_request_max_batch_size=GLOBAL_REQUEST_MAX_BATCH_SIZE,
-    attn_dp_group_size=ATTN_DP_GROUP_SIZE,
-    tokens_after_reaching_max_bs: int | None = None,
-    enable_defrag_v0_debug_log: bool = False,
-    scheduling_policy: str = SCHEDULING_POLICY,
-    per_token_begin_cb: Callable[[Token], None] | None = None,
-    per_token_stats_cb: Callable[[Token, float], None] | None = None,
-    net_delay_fn: Callable[[int, int, int], float] | None = None,
-    n_gpu_per_host: int | None = None,
+    attn_dp_group_size=ATTN_DP_GROUP_SIZE, tokens_after_reaching_max_bs=None,
+    enable_defrag_v0_debug_log=False, scheduling_policy=SCHEDULING_POLICY,
+    per_token_begin_cb=None, per_token_stats_cb=None, net_delay_fn=None,
+    n_gpu_per_host=None, *, max_attention_batch_size=160,
+    attention_profile_path=None, grouped_profile_path=None, expert_cost_scale=1.0,
+    initial_context_length=0, finalize_per_token_t=0.0,
+    attn_service_t=None, net_t_attn_to_expert=None, net_t_expert_to_attn=None,
+    ticks_per_millisecond=TICKS_PER_MILLISECOND, rng_seed=RNG_SEED,
+    defrag_lookahead_steps=4, defrag_lookback_steps=4, defrag_weight_decay=0.8,
+    metric_sample_capacity=100000, schedule_trace_limit=0, quiet=False,
+    queue_trace_path=None, queue_trace_interval_ms=0.1,
+    queue_trace_start_ms=0.0, queue_trace_end_ms=None,
+    arrival_times_ms=None, observer=None, routing_request_indices=None,
+    expert_scheduling="layer", execution_mode="async", overhead_config=None,
+    hidden_dim=2048, bytes_per_element=2,
+    token_trace_path=None, token_trace_start_ms=0.0, token_trace_end_ms=None,
 ):
-    random.seed(RNG_SEED)
-    env = simpy.Environment()
-    expected_total_tokens = total_requests * tokens_per_request
-    progress_tracker = ProgressTracker(expected_total_tokens)
+    """Run one finite decode workload; callbacks and legacy result keys retained.
 
-    # For metrics
-    completion_times = {}  # tid -> absolute completion time
-    token_latencies = {}   # tid -> completion_time - birth_time
-    request_latency_values: List[float] = []
-
-    if per_token_stats_cb is None:
-        def record_completion(token: Token, t_complete: float):
-            completion_times[token.tid] = t_complete
-            token_latencies[token.tid] = t_complete - token.birth_time
-            progress_tracker.update(len(completion_times))
+    Costs/arrival_rate use ticks. Admission is a request-count cap, not KV-memory
+    admission. Initial KV context plus token_index gives the decode KV history.
+    First-token samples are excluded from metrics_ms['itl']. Receive contention
+    is enabled only when net_delay_fn is supplied. Local transfers cost zero.
+    Optional queue traces integrate ready queues over real event intervals;
+    their window/interval parameters are milliseconds and add no sample events.
+    Explicit arrival times are absolute milliseconds and override arrival_rate.
+    Optional routing indices are profile request ordinals, with no token wrap.
+    expert_scheduling='expert' compares individual expert queues with attention
+    queues, executing only the winning expert up to max_batch_size. The default
+    'layer' retains local grouped execution. Both share one GPU compute resource.
+    Optional token traces sample attention selections in a millisecond window
+    and follow each token through expert fork/join to its next attention start,
+    even beyond the window. They add no simulator events and support async only.
+    """
+    positive_ints = dict(ep_group_size=ep_group_size, total_expert_count=total_expert_count,
+        max_batch_size=max_batch_size, num_layers=num_layers, tokens_per_request=tokens_per_request,
+        global_request_max_batch_size=global_request_max_batch_size,
+        max_attention_batch_size=max_attention_batch_size, routing_top_k=routing_top_k,
+        metric_sample_capacity=metric_sample_capacity, hidden_dim=hidden_dim,
+        bytes_per_element=bytes_per_element)
+    for name, value in positive_ints.items():
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for name, value in dict(total_requests=total_requests, initial_context_length=initial_context_length,
+                            schedule_trace_limit=schedule_trace_limit).items():
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+    if total_expert_count % ep_group_size or routing_top_k > total_expert_count:
+        raise ValueError("experts must divide evenly across GPUs and top-k must not exceed experts")
+    if attn_dp_group_size != ep_group_size:
+        raise ValueError("unified compute requires attn_dp_group_size == ep_group_size")
+    if tokens_after_reaching_max_bs is not None and (not isinstance(tokens_after_reaching_max_bs, Integral)
+                                                   or tokens_after_reaching_max_bs < 0):
+        raise ValueError("tokens_after_reaching_max_bs must be a nonnegative integer")
+    if not math.isfinite(ticks_per_millisecond) or ticks_per_millisecond <= 0:
+        raise ValueError("ticks_per_millisecond must be finite and positive")
+    dispatch_t = NET_T_ATTN_TO_EXPERT if net_t_attn_to_expert is None else net_t_attn_to_expert
+    return_t = NET_T_EXPERT_TO_ATTN if net_t_expert_to_attn is None else net_t_expert_to_attn
+    for name, value in dict(arrival_rate=arrival_rate, dispatch_delay=dispatch_t,
+                            return_delay=return_t, finalize_per_token_t=finalize_per_token_t).items():
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    gpus_per_host = ep_group_size if n_gpu_per_host is None else n_gpu_per_host
+    if not isinstance(gpus_per_host, Integral) or gpus_per_host < 1:
+        raise ValueError("n_gpu_per_host must be a positive integer")
+    policy = "mtfs" if scheduling_policy == "longest_queue_first" else scheduling_policy
+    if execution_mode not in ("async", "sync", "tbo"):
+        raise ValueError("execution_mode must be 'async', 'sync', or 'tbo'")
+    if token_trace_path is not None and execution_mode != "async":
+        raise ValueError("token tracing supports execution_mode='async' only")
+    # Reject invalid cost assumptions before loading profiles or opening files.
+    overhead_config = BatchOverheadModel(
+        ticks_per_millisecond=ticks_per_millisecond, **(overhead_config or {})).config()
+    if expert_scheduling not in ("layer", "expert"):
+        raise ValueError("expert_scheduling must be 'layer' or 'expert'")
+    # Validate policy before loading potentially large profiles.
+    if execution_mode == "async":
+        UnifiedScheduler(num_layers, routing_top_k, policy, defrag_lookahead_steps,
+                         defrag_lookback_steps, defrag_weight_decay)
     else:
-        def record_completion(token: Token, t_complete: float):
-            completion_times[token.tid] = t_complete
-            token_latencies[token.tid] = t_complete - token.birth_time
-            progress_tracker.update(len(completion_times))
-            if token.sampled_for_stats:
-                per_token_stats_cb(token, t_complete)
-
-    def record_request_completion(request_id: int, latency: float):
-        request_latency_values.append(latency)
-
-    defrag_v0_debug_state = (
-        DefragV0DebugState(enabled=True)
-        if enable_defrag_v0_debug_log
-        else None
-    )
-
-    # Attention parallelism: ATTN_DP_GROUP_SIZE workers globally. Caller is
-    # expected to set this explicitly; we still clamp it to a positive int.
-    attn_dp_group_size = max(1, int(attn_dp_group_size))
-    if int(attn_dp_group_size) != int(ep_group_size):
-        raise ValueError(
-            "sim_async models attention and expert compute sharing the same GPUs; "
-            "set attn_dp_group_size == ep_group_size to enforce mutual exclusion."
-        )
-
-    request_manager = RequestManager(
-        env=env,
-        tokens_per_request=tokens_per_request,
-        record_completion_cb=record_completion,
-        request_complete_cb=record_request_completion,
-        max_active_requests=global_request_max_batch_size,
-        attn_dp_group_size=attn_dp_group_size,
-        defrag_v0_debug_state=defrag_v0_debug_state,
-        token_begin_cb=per_token_begin_cb,
-    )
-    if defrag_v0_debug_state is not None:
-        defrag_v0_debug_state.get_active_requests = lambda: request_manager.active_requests
-        defrag_v0_debug_state.get_pending_queue_len = lambda: request_manager.pending_queue_len
-        defrag_v0_debug_state.get_tokens_created = lambda: request_manager._next_tid
-        defrag_v0_debug_state.get_tokens_completed = lambda: len(completion_times)
-
-    final_completion_tracker = FinalCompletionTracker(
-        final_layer_idx=num_layers - 1,
-        completion_callback=request_manager.handle_token_completion,
-    )
-
-    # Build expert workers (shared across all layers) and per-layer attention workers.
-    expert_workers = []
-    attention_layers = []
-
-    queues_per_worker_per_layer = total_expert_count // ep_group_size
-
-    # Aggregate statistics for per-expert batch sizes.
-    batch_stats = {
-        "total_batch_size": 0.0,
-        "total_batches": 0,
-    }
-
-    # Load compute profile into a lookup table and validate coverage
-    compute_time_lookup = expert_compute_time_lookup_table_from_profile(
-        expert_profile_path,
-        max_batch_size,
-        ticks_per_millisecond=TICKS_PER_MILLISECOND,
-    )
-
-    profile_router = build_profile_router(
-        profile_path=profile_routing_path,
-        num_experts=total_expert_count,
-        top_k=routing_top_k,
-    )
-
-    # Build experts first with attention pointer set to None.
-    # Then create attention workers and patch each expert's attention_layers reference.
-
-    # Create one IngressPort per GPU for congestion-aware network simulation.
-    # Each port has two independent FIFO channels (NVLink and RDMA).
-    # Transfers are classified by topology and queued on the appropriate
-    # channel; each channel processes one transfer at a time at full
-    # bandwidth.  The port is shared by both dispatch (attn→expert) and
-    # return (expert→attn) traffic targeting this GPU.
-    ingress_ports: List[IngressPort] | None = None
-    if net_delay_fn is not None:
-        _n_gpu_per_host = n_gpu_per_host if n_gpu_per_host is not None else ep_group_size
-        ingress_ports = [
-            IngressPort(env, gpu_idx=i, n_gpu_per_host=_n_gpu_per_host)
-            for i in range(ep_group_size)
-        ]
-
-    # Create expert workers (global across all layers)
-    for w in range(ep_group_size):
-        worker = ExpertWorker(
-            env=env,
-            worker_idx=w,
-            num_layers=num_layers,
-            num_queues_per_worker_per_layer=queues_per_worker_per_layer,
-            max_batch_size=max_batch_size,
-            compute_time_lookup=compute_time_lookup,
-            net_t_expert_to_attn=NET_T_EXPERT_TO_ATTN,
-            net_delay_fn=net_delay_fn,
-            ingress_ports=ingress_ports,
-            attention_layers=None,  # temp, will fix after we create them
-            final_completion_tracker=final_completion_tracker,
-            batch_stats=batch_stats,
-            defrag_v0_debug_state=defrag_v0_debug_state,
-            scheduling_policy=scheduling_policy,
-            routing_top_k=routing_top_k,
-        )
-        expert_workers.append(worker)
-
-    if defrag_v0_debug_state is not None:
-        defrag_v0_debug_state.get_attention_users = lambda: sum(
-            1 for worker in expert_workers if worker.inflight_attention
-        )
-        defrag_v0_debug_state.get_attention_queue = lambda: sum(
-            int(worker.attention_queue_length) for worker in expert_workers
-        )
-
-    if defrag_v0_debug_state is not None:
-        def _global_queued_tokens() -> int:
-            total = 0
-            for worker in expert_workers:
-                for layer_queues in worker.queues:
-                    for q in layer_queues:
-                        total += len(q)
-            return total
-
-        def _global_inflight_tokens() -> int:
-            return sum(int(w._inflight_batch_size) for w in expert_workers)
-
-        def _per_worker_queued_tokens() -> List[int]:
-            totals: List[int] = []
-            for worker in expert_workers:
-                total = 0
-                for layer_queues in worker.queues:
-                    for q in layer_queues:
-                        total += len(q)
-                totals.append(total)
-            return totals
-
-        def _per_worker_inflight_tokens() -> List[int]:
-            return [int(w._inflight_batch_size) for w in expert_workers]
-
-        defrag_v0_debug_state.get_global_expert_queued_tokens = _global_queued_tokens
-        defrag_v0_debug_state.get_global_expert_inflight_tokens = _global_inflight_tokens
-        defrag_v0_debug_state.get_per_worker_expert_queued_tokens = _per_worker_queued_tokens
-        defrag_v0_debug_state.get_per_worker_expert_inflight_tokens = _per_worker_inflight_tokens
-
-    # Now create attention workers (they need expert_layers)
-    for layer in range(num_layers):
-        attn = AttentionWorker(
-            env=env,
-            layer_idx=layer,
-            total_expert_count=total_expert_count,
-            ep_group_size=ep_group_size,
-            attn_service_t=ATTN_SERVICE_T,
-            net_t_attn_to_expert=NET_T_ATTN_TO_EXPERT,
-            net_delay_fn=net_delay_fn,
-            ingress_ports=ingress_ports,
-            expert_workers=expert_workers,
-            profile_router=profile_router,
-        )
-        attention_layers.append(attn)
-
-    request_manager.set_first_attention(attention_layers[0])
-    if defrag_v0_debug_state is not None:
-        def _pending_tokens_total() -> int:
-            return sum(len(attn.pending_tokens) for attn in attention_layers)
-
-        def _pending_tokens_per_layer() -> List[int]:
-            return [len(attn.pending_tokens) for attn in attention_layers]
-
-        defrag_v0_debug_state.get_pending_tokens_total = _pending_tokens_total
-        defrag_v0_debug_state.get_pending_tokens_per_layer = _pending_tokens_per_layer
-
-    # Now that we have attention_layers, fix the forward pointers in experts
-    for w in expert_workers:
-        w.attention_layers = attention_layers
-
-    # Create the request source
-    env.process(request_source(
-        env,
-        total_requests=total_requests,
-        arrival_rate=arrival_rate,
-        request_manager=request_manager,
-    ))
-
-    steps_executed = 0
-    saturation_step: int | None = None
-    saturation_tokens_completed: int | None = None
-    saturation_time: float | None = None
-    if tokens_after_reaching_max_bs is not None:
-        tokens_after_reaching_max_bs = int(tokens_after_reaching_max_bs)
-        if tokens_after_reaching_max_bs < 0:
-            raise ValueError("tokens_after_reaching_max_bs must be >= 0 or None")
-
-        # Step event-by-event so we can stop shortly after the system reaches
-        # the configured max active request batch size (i.e., saturation), once
-        # enough additional tokens have completed.
+        if expert_scheduling != "layer":
+            raise ValueError("collective baselines require expert_scheduling='layer'")
+        policy = execution_mode
+    router = build_profile_router(profile_routing_path, total_expert_count, routing_top_k)
+    router.validate_layers(num_layers)
+    lookup = expert_compute_time_lookup_table_from_profile(expert_profile_path, max_batch_size,
+                                                            ticks_per_millisecond=ticks_per_millisecond)
+    expert_cost = ExpertCostModel(lookup, expert_cost_scale, grouped_profile_path, ticks_per_millisecond)
+    attention_cost = AttentionCostModel(ATTN_SERVICE_T if attn_service_t is None else attn_service_t,
+                                       attention_profile_path, ticks_per_millisecond)
+    settings = dict(num_gpus=ep_group_size, num_experts=total_expert_count, num_layers=num_layers,
+        top_k=routing_top_k, expert_batch_cap=max_batch_size, attn_batch_cap=max_attention_batch_size,
+        total_requests=total_requests, tokens_per_request=tokens_per_request, arrival_rate=arrival_rate,
+        active_cap=global_request_max_batch_size, initial_context=initial_context_length,
+        finalize_t=finalize_per_token_t, dispatch_t=dispatch_t, return_t=return_t,
+        net_delay_fn=net_delay_fn, gpus_per_host=gpus_per_host, ticks_per_ms=ticks_per_millisecond,
+        seed=rng_seed, policy=policy, expert_scheduling=expert_scheduling, lookahead_steps=defrag_lookahead_steps,
+        lookback_steps=defrag_lookback_steps, weight_decay=defrag_weight_decay,
+        metric_sample_cap=metric_sample_capacity, trace_limit=schedule_trace_limit,
+        stop_after=tokens_after_reaching_max_bs, debug=enable_defrag_v0_debug_log,
+        queue_trace_path=queue_trace_path, queue_trace_interval_ms=queue_trace_interval_ms,
+        queue_trace_start_ms=queue_trace_start_ms, queue_trace_end_ms=queue_trace_end_ms,
+        token_trace_path=token_trace_path, token_trace_start_ms=token_trace_start_ms,
+        token_trace_end_ms=token_trace_end_ms,
+        arrival_times_ms=arrival_times_ms, observer=observer,
+        routing_request_indices=routing_request_indices,
+        overhead_config=overhead_config,
+        hidden_dim=hidden_dim, bytes_per_element=bytes_per_element,
+        begin_cb=per_token_begin_cb, stats_cb=per_token_stats_cb, quiet=quiet)
+    simulator_type = AsyncMoESimulator
+    if execution_mode != "async":
+        if __package__:
+            from .sim_collective import CollectiveMoESimulator
+        else:
+            from sim_collective import CollectiveMoESimulator
+        simulator_type = CollectiveMoESimulator
+        settings["execution_mode"] = execution_mode
+    simulator = simulator_type(settings=settings, router=router, expert_cost=expert_cost,
+                               attention_cost=attention_cost)
+    try:
+        return simulator.run()
+    finally:
         try:
-            while True:
-                env.step()
-                steps_executed += 1
-
-                if (
-                    saturation_step is None
-                    and request_manager.max_active_requests is not None
-                    and request_manager.active_requests
-                    >= request_manager.max_active_requests
-                ):
-                    saturation_step = steps_executed
-                    saturation_tokens_completed = len(completion_times)
-                    saturation_time = float(env.now)
-
-                if (
-                    saturation_tokens_completed is not None
-                    and (len(completion_times) - saturation_tokens_completed)
-                    >= tokens_after_reaching_max_bs
-                ):
-                    break
-        except simpy.core.EmptySchedule:
-            pass
-    else:
-        # Run until all tokens are completed.
-        # Easiest is to run until the event queue drains; since we only
-        # generate a finite number of tokens per request and they all eventually
-        # complete, the sim will naturally finish.
-        env.run()
-
-    if len(completion_times) >= expected_total_tokens:
-        progress_tracker.finalize()
-    else:
-        progress_tracker.update(len(completion_times), force=True)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-    # Metrics
-    stopped_early = len(completion_times) != expected_total_tokens
-    if stopped_early and tokens_after_reaching_max_bs is None:
-        print(
-            "WARNING: some tokens did not complete!",
-            len(completion_times),
-            "/",
-            expected_total_tokens,
-        )
-
-    latencies = list(token_latencies.values())
-    avg_latency = sum(latencies) / len(latencies) if latencies else float("nan")
-    makespan = float(env.now)
-
-    request_latencies_ms = [
-        latency / TICKS_PER_MILLISECOND for latency in request_latency_values
-    ]
-    avg_request_latency_ms = (
-        sum(request_latencies_ms) / len(request_latencies_ms)
-        if request_latencies_ms
-        else float("nan")
-    )
-    p90_request_latency_ms = (
-        percentile(request_latency_values, 0.90) / TICKS_PER_MILLISECOND
-        if request_latency_values
-        else float("nan")
-    )
-    p99_request_latency_ms = (
-        percentile(request_latency_values, 0.99) / TICKS_PER_MILLISECOND
-        if request_latency_values
-        else float("nan")
-    )
-
-    makespan_ms = makespan / TICKS_PER_MILLISECOND
-    makespan_sec = makespan_ms / 1000.0 if makespan_ms > 0 else 0.0
-    completed_tokens = len(completion_times)
-    avg_throughput_req_per_sec = (
-        (completed_tokens / float(tokens_per_request)) / makespan_sec
-        if makespan_sec > 0 and tokens_per_request > 0
-        else 0.0
-    )
-
-    tail_throughput_req_per_sec = float("nan")
-    if (
-        tokens_after_reaching_max_bs is not None
-        and stopped_early
-        and saturation_time is not None
-        and saturation_tokens_completed is not None
-        and tokens_per_request > 0
-        and makespan > float(saturation_time)
-    ):
-        tail_tokens = completed_tokens - int(saturation_tokens_completed)
-        tail_seconds = ((makespan - float(saturation_time)) / TICKS_PER_MILLISECOND) / 1000.0
-        if tail_seconds > 0:
-            tail_throughput_req_per_sec = (tail_tokens / float(tokens_per_request)) / tail_seconds
-
-    # Average per-expert batch size across all expert compute invocations.
-    if batch_stats["total_batches"] > 0:
-        avg_per_expert_batch_size = (
-            batch_stats["total_batch_size"] / batch_stats["total_batches"]
-        )
-    else:
-        avg_per_expert_batch_size = 0.0
-
-    if stopped_early:
-        print(
-            f"Simulation stopped early at time {makespan:.3f} "
-            f"(completed_tokens={completed_tokens}/{expected_total_tokens}, "
-            f"steps_executed={steps_executed}, saturation_step={saturation_step})"
-        )
-    else:
-        print(f"Simulation finished at time {makespan:.3f}")
-
-    print(f"Average completion time over {len(latencies)} tokens: {avg_latency:.3f}")
-    print(f"Average throughput: {avg_throughput_req_per_sec:.3f} requests/sec")
-    if tail_throughput_req_per_sec == tail_throughput_req_per_sec and math.isfinite(tail_throughput_req_per_sec):
-        print(
-            f"Tail throughput (after saturation, {tokens_after_reaching_max_bs} tokens): "
-            f"{tail_throughput_req_per_sec:.3f} requests/sec"
-        )
-    print(f"Average request latency: {avg_request_latency_ms:.3f} ms")
-    print(f"P90 request latency: {p90_request_latency_ms:.3f} ms")
-    print(f"P99 request latency: {p99_request_latency_ms:.3f} ms")
-    print(f"Average per-expert batch size: {avg_per_expert_batch_size:.3f}")
-
-    return {
-        "completion_times": completion_times,
-        "avg_latency": avg_latency,
-        "makespan": makespan,
-        "avg_throughput_req_per_sec": avg_throughput_req_per_sec,
-        "tail_throughput_req_per_sec": tail_throughput_req_per_sec,
-        "avg_request_latency_ms": avg_request_latency_ms,
-        "p90_request_latency_ms": p90_request_latency_ms,
-        "p99_request_latency_ms": p99_request_latency_ms,
-        "avg_per_expert_batch_size": avg_per_expert_batch_size,
-        "stopped_early": stopped_early,
-        "steps_executed": steps_executed,
-        "saturation_step": saturation_step,
-        "saturation_tokens_completed": saturation_tokens_completed,
-        "saturation_time": saturation_time,
-        "defrag_v0_debug_triggered": (
-            defrag_v0_debug_state.triggered
-            if defrag_v0_debug_state is not None
-            else False
-        ),
-        "defrag_v0_debug_trigger_time": (
-            defrag_v0_debug_state.trigger_time
-            if defrag_v0_debug_state is not None
-            else None
-        ),
-        "defrag_v0_debug_logged": (
-            defrag_v0_debug_state.logged
-            if defrag_v0_debug_state is not None
-            else False
-        ),
-        "defrag_v0_debug_entry": (
-            defrag_v0_debug_state.entry
-            if defrag_v0_debug_state is not None
-            else None
-        ),
-    }
+            if simulator.queue_trace is not None:
+                simulator.queue_trace.close()
+        finally:
+            if simulator.token_trace is not None:
+                simulator.token_trace.close(simulator.env.now)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "kind": "composed_operator_profile_proxy",
+  "upstream_repository": "https://github.com/casys-kaist/LLMServingSim",
+  "upstream_commit": "b09c7aaab4b072d73136641841cc2688616c49eb",
+  "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "variant": "bf16",
+  "tensor_parallel_size": 1,
+  "vllm_version": "0.28.0",
+  "cuda_version": "13.0",
+  "source_measurement": {
+    "load_format": "dummy",
+    "enforce_eager": true,
+    "num_hidden_layers": 1,
+    "measurement_iterations": 3
+  },
+  "sources": {
+    "attention.csv": {
+      "upstream_path": "profiler/perf/RTXPRO6000/Qwen/Qwen3-30B-A3B-Instruct-2507/bf16/tp1/attention.csv",
+      "url": "https://github.com/casys-kaist/LLMServingSim/blob/b09c7aaab4b072d73136641841cc2688616c49eb/profiler/perf/RTXPRO6000/Qwen/Qwen3-30B-A3B-Instruct-2507/bf16/tp1/attention.csv",
+      "sha256": "d62ea19809d848ced8e5a12b623c0a94491d69409284a13a5ff91975a42ccb30"
+    },
+    "dense.csv": {
+      "upstream_path": "profiler/perf/RTXPRO6000/Qwen/Qwen3-30B-A3B-Instruct-2507/bf16/tp1/dense.csv",
+      "url": "https://github.com/casys-kaist/LLMServingSim/blob/b09c7aaab4b072d73136641841cc2688616c49eb/profiler/perf/RTXPRO6000/Qwen/Qwen3-30B-A3B-Instruct-2507/bf16/tp1/dense.csv",
+      "sha256": "b876a54dd1e05c0454295cb92469b07a47700e0db4768846b0722d630dcc574b"
+    },
+    "meta.yaml": {
+      "upstream_path": "profiler/perf/RTXPRO6000/Qwen/Qwen3-30B-A3B-Instruct-2507/bf16/meta.yaml",
+      "url": "https://github.com/casys-kaist/LLMServingSim/blob/b09c7aaab4b072d73136641841cc2688616c49eb/profiler/perf/RTXPRO6000/Qwen/Qwen3-30B-A3B-Instruct-2507/bf16/meta.yaml",
+      "sha256": "a230fe396685686a9f0ea94edceec7b4b0f6666167bb691d4dabf5354f933bf8"
+    },
+    "qwen3.yaml": {
+      "upstream_path": "profiler/models/qwen3.yaml",
+      "url": "https://github.com/casys-kaist/LLMServingSim/blob/b09c7aaab4b072d73136641841cc2688616c49eb/profiler/models/qwen3.yaml",
+      "sha256": "218a1f0dee83f973b14435e0170283b1e89bebcbd188f4c31f86a80489b73723"
+    },
+    "timings.py": {
+      "upstream_path": "profiler/core/hooks/timings.py",
+      "url": "https://github.com/casys-kaist/LLMServingSim/blob/b09c7aaab4b072d73136641841cc2688616c49eb/profiler/core/hooks/timings.py",
+      "sha256": "5a83b045c4d1d72549cc9643832a6127c7ae2e40ad738ef84e58b323e13225aa"
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "url": "https://github.com/casys-kaist/LLMServingSim/blob/b09c7aaab4b072d73136641841cc2688616c49eb/LICENSE",
+      "sha256": "d74d0ee1a35975f6bd570bdcffbc5bf99fc3e808850da80b8aad8ab7308696f0"
+    }
+  },
+  "adapter_sha256": "d5f2f4fdfd911617b2d045692cb4cc7bb167ca492f57f4a998145f63fed51a23",
+  "output": {
+    "sha256": "73d320015ea7569ac136c389ccc50206cbed6736a81c6463252311b4076c9698",
+    "rows": 4560,
+    "batch_sizes": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      20,
+      24,
+      28,
+      32,
+      36,
+      40,
+      44,
+      48,
+      52,
+      56,
+      60,
+      64,
+      80,
+      96,
+      112,
+      128,
+      144,
+      160,
+      176,
+      192,
+      208,
+      224,
+      240,
+      256
+    ],
+    "context_lengths": [
+      16,
+      24,
+      36,
+      54,
+      81,
+      122,
+      182,
+      273,
+      410,
+      615,
+      923,
+      1384,
+      2076,
+      3114,
+      4671,
+      7006,
+      10509,
+      15764,
+      16384
+    ],
+    "time_unit": "ms"
+  },
+  "composition": {
+    "attention_core": 1,
+    "qkv_proj": 1,
+    "qk_norm": 1,
+    "rotary_emb": 1,
+    "o_proj": 1,
+    "layernorm": 2
+  },
+  "context_semantics": "KV history before current query; one decode query per request",
+  "selection": "layer=attention, prefill_chunk=0, prefill_key=0, decode_q_len=1, n_decode>0",
+  "grid": "union of core/dense batch breakpoints in common range; measured core context axis",
+  "interpolation": "linear per axis; preserves dense measurements; core values at added batch points are interpolated",
+  "normalization": "layernorm is per-call mean used twice; qk_norm combines Q and K and is used once",
+  "hardware_calibrated_for_current_simulation": false,
+  "limitations": [
+    "RTXPRO6000 Attention plus existing A100 expert profile is a cross-hardware proxy, without hardware scaling.",
+    "Upstream Qwen includes QK norm; current StreamInfer Attention omits it. Routing/gate/top-k is not included here.",
+    "No CPU scheduling, batch reformation, communication, or CUDA Graph padding costs are added.",
+    "Summed operator costs are not a measured end-to-end StreamInfer Attention-stage latency.",
+    "Existing expert CSV remains a grouped single-GEMM per-expert proxy, not a full MLP measurement.",
+    "One table is reused for all simulated layers; no prefill, heterogeneous-length correction, or extrapolation."
+  ]
+}

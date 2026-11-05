@@ -69,6 +69,18 @@ def parse_configuration(argv=None):
         wrapper.error("Use either --nsys or --profile-dir, not both CUPTI collectors")
     if args.nsys and options.mode == "server":
         wrapper.error("Nsight capture supports one smoke/benchmark run per launch; use benchmark mode")
+    if args.synchronized_start:
+        if options.mode == "server":
+            wrapper.error("--synchronized-start supports one smoke/benchmark cohort; use benchmark mode")
+        # Keep dry-run independent of the GPU/runtime package imports.
+        sync_spec = importlib.util.spec_from_file_location(
+            "rtx4090_synchronized_start", REPO / "disagmoe/utils/synchronized_start.py")
+        sync_start = importlib.util.module_from_spec(sync_spec)
+        sync_spec.loader.exec_module(sync_start)
+        try:
+            sync_start.validate_configuration(args)
+        except ValueError as exc:
+            wrapper.error(str(exc))
     return options, args, cli_args
 
 
@@ -181,6 +193,15 @@ def main(argv=None):
                     "coverage": "GPU Engine actors; driver/tokenizer/detokenizer CPU not captured",
                     "capture_window": "after warmup until all benchmark responses arrive",
                 }
+                if args.synchronized_start:
+                    manifest["workload"] = master.synchronized_start_report["workload"]
+                    manifest["capture_window"] = (
+                        "after initial-batch preparation, including the common release wait, "
+                        "until all benchmark responses arrive")
+                    manifest["synchronized_start"] = {
+                        "report_file": str(Path(str(args.file) + ".synchronized-start.json").resolve()),
+                        "report": getattr(master, "synchronized_start_report", None),
+                    }
                 (profile_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
                 print(f"PROFILE: copied {len(reports)} reports to {profile_dir}; inspect with nsys stats/GUI.", flush=True)
     finally:

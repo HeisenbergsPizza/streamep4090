@@ -3,7 +3,9 @@ from argparse import ArgumentParser
 def add_workload_arguments(parser: ArgumentParser):
     parser.add_argument("-n", "--num-requests", type=int, default=1000, help="number of requests to generate")
     parser.add_argument("-r", "--rate", type=float, default=0, help="rate of incoming requests, requests per second")
-    parser.add_argument("--generator-type", type=str, default="poisson", help="generator type, including 'poisson', 'uniform', 'incremental_poisson' and 'dataset'.")
+    parser.add_argument("--generator-type", type=str, default="poisson", help="generator type, including 'poisson', 'uniform', 'offline', 'incremental_poisson' and 'dataset'.")
+    parser.add_argument("--synchronized-start", action="store_true",
+                        help="prepare an equal initial attention batch on each GPU, release once, then run asynchronously; requires single-node offline workload with fixed lengths")
     parser.add_argument("--min-input-len", type=int, default=30, help="minimum prefill length for each seqeunce")
     parser.add_argument("--max-input-len", type=int, default=70, help="initial prefill length for each seqeunce")
     parser.add_argument("--min-output-len", type=int, default=80, help="maximum prefill length for each seqeunce")

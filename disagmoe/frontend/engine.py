@@ -42,7 +42,7 @@ from disagmoe.block_manager.block_manager import BaseBlockManager
 from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 
 from typing import Optional, List, Dict, Callable, Tuple, Any, Deque
-from threading import Thread
+from threading import Thread, Event
 from torch import Tensor
 from collections import deque
 import torch.distributed as dist
@@ -531,6 +531,10 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         self.profile_dir = None
         self._nsys_profile_active = False
         self._nsys_markers_enabled = os.environ.get("DMOE_ENABLE_NVTX", "0") == "1"
+        self._synchronized_start_pending = None
+        self._synchronized_start_status = None
+        self._synchronized_start_cancelled = Event()
+        self._synchronized_start_labels = False
         self.local_to_gloabl_expert_rank = []
         self.global_to_local_expert_rank = []
         self.device_group_ids = []
@@ -728,6 +732,107 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
     def get_loop_error(self):
         """Expose inference-thread failures to the controller's result poller."""
         return self.loop_error
+
+    def arm_synchronized_start(self, gate, requests):
+        """Hand a complete initial cohort to the inference thread, without CUDA RPC work."""
+        from disagmoe.utils.synchronized_start import validate_gate
+
+        validate_gate(gate["directory"], gate["run_id"])
+        if self.loop_error or self.end_flag or not self.loop_thread.is_alive():
+            raise RuntimeError("Cannot prepare synchronized start on a stopped engine")
+        if self._synchronized_start_status is not None:
+            raise RuntimeError("Synchronized start is a one-shot experiment per engine")
+        if not self.has_attn or not self.has_expert or self._tp_enabled:
+            raise ValueError("Synchronized start requires colocated attention/experts and TP=1")
+        if not requests or len(requests) > self.engine_config.max_batch_size_attn:
+            raise ValueError("Initial cohort must fit one attention batch")
+        req_ids = [r["req_id"] for r in requests]
+        if len(set(req_ids)) != len(req_ids):
+            raise ValueError("Duplicate request IDs in initial cohort")
+        self._synchronized_start_labels = True
+        self._synchronized_start_status = {
+            "state": "armed", "device_id": self.device_id,
+            "attn_dp_rank": self.attn_dp_rank, "req_ids": req_ids,
+            "initial_batch_size": len(requests), "layer_id": 0,
+        }
+        # Publish last: the inference thread cannot see an incomplete command.
+        self._synchronized_start_pending = (dict(gate), list(requests))
+
+    def get_synchronized_start_status(self):
+        status = dict(self._synchronized_start_status or {"state": "unarmed"})
+        if self.loop_error:
+            status.update(state="failed", error=self.loop_error)
+        return status
+
+    def cancel_synchronized_start(self):
+        self._synchronized_start_cancelled.set()
+        # This is a dedicated, one-shot benchmark. A failed cohort cannot be
+        # safely reused after some workers have already executed first attention.
+        self.end_flag = True
+
+    def _execute_synchronized_start(self):
+        """Prepare once on the CUDA-owning thread, then wait for the common CPU gate."""
+        from disagmoe.utils.synchronized_start import wait_for_release
+
+        gate, requests = self._synchronized_start_pending
+        self._synchronized_start_pending = None
+        status = dict(self._synchronized_start_status, state="preparing")
+        self._synchronized_start_status = status
+        # Warmup must be drained; refuse to inject into a nonempty scheduler.
+        previous, _ = self._schedule_batch_with_optional_trace()
+        if previous.data is not None:
+            raise RuntimeError("Synchronized start requires an empty scheduler after warmup")
+        count = len(requests)
+        req_ids = [r["req_id"] for r in requests]
+        meta = BatchMetadata(
+            shape=[count, self.model_config.hidden_size], dtype="bfloat16",
+            layer_id=0, req_ids=req_ids, exp_ids=[0] * count,
+            topk_weights=[1.0] * count, attn_dp_ranks=[self.attn_dp_rank] * count,
+            init_prefill_lens=[r["input_len"] for r in requests],
+        )
+        for request in requests:
+            self.record_max_output_lens(request["req_id"], request["output_len"])
+        incoming = TokenBatch_C()
+        incoming.data = torch.rand((count, self.model_config.hidden_size),
+                                   dtype=torch.bfloat16, device=self.device)
+        incoming.metadata = meta.to_c()
+        self.pool.put_batch(incoming)
+        self._advanced_logger.log_pool_put(count)
+        # Let the native scheduler build the initial-request metadata. Its
+        # prefill counters register KV state even though this benchmark decodes.
+        batch, _ = self._schedule_batch_with_optional_trace()
+        if batch.data is None:
+            raise RuntimeError("Initial cohort was not available to the scheduler")
+        wrapper = TokenBatchCWrapper.from_c(batch)
+        meta = wrapper.metadata
+        if (meta.is_expert() or meta.layer_id != 0 or meta.num_tokens() != count
+                or sorted(meta.req_ids) != sorted(req_ids)):
+            raise RuntimeError("Scheduler did not return the complete layer-0 attention cohort")
+        forward_batch = self.preprocess_batch(wrapper)
+        if forward_batch is None:
+            raise RuntimeError("Initial attention preprocessing returned no work")
+        # This one-time synchronization finishes random inputs, KV/metadata
+        # preparation and copies before ready is visible to the controller.
+        self.stream.synchronize()
+        status = dict(status, state="ready", prepared_ns=time.perf_counter_ns())
+        self._synchronized_start_status = status
+        cancelled = lambda: self.end_flag or self._synchronized_start_cancelled.is_set()
+        if self._nsys_markers_enabled:
+            with nvtx_range("Engine.synchronized_start.wait"):
+                release = wait_for_release(gate["directory"], gate["run_id"], cancelled=cancelled)
+        else:
+            release = wait_for_release(gate["directory"], gate["run_id"], cancelled=cancelled)
+        status = dict(status, state="released", release_ns=release["release_ns"],
+                      execute_begin_ns=time.perf_counter_ns())
+        self._synchronized_start_status = status
+        if self._nsys_markers_enabled:
+            with nvtx_range(f"Engine.execute.attn.layer=0.batch={count}.initial"):
+                result = forward_batch.proc_func(forward_batch)
+        else:
+            result = forward_batch.proc_func(forward_batch)
+        self._synchronized_start_status = dict(status, state="executed")
+        self.step_profile(count)
+        return forward_batch, result
 
     def start_nsys_profile(self):
         """Open this actor's CUDA-profiler capture range after warmup."""
@@ -1029,6 +1134,14 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
 
         try:
             while not self.end_flag:
+                if (self._synchronized_start_pending is not None
+                        and last_batch is None and not result_queue):
+                    forward_batch, result = self._execute_synchronized_start()
+                    result_queue.append((forward_batch, result))
+                    last_batch = forward_batch
+                    # The original loop posts this result on its next iteration.
+                    # All subsequent scheduling and decode rounds stay async.
+                    continue
                 _inf_iter_count += 1
                 _it_t0 = time.perf_counter()
                 self._drain_moe_events()
@@ -1069,7 +1182,11 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                         forward_batch = self.preprocess_batch(batch_wrapper)
                     if forward_batch is not None:
                         if self._nsys_markers_enabled:
-                            with nvtx_range("Engine.execute"):
+                            label = "Engine.execute"
+                            if self._synchronized_start_labels:
+                                kind = "expert" if meta.is_expert() else "attn"
+                                label += f".{kind}.layer={meta.layer_id}.batch={meta.num_tokens()}"
+                            with nvtx_range(label):
                                 result = forward_batch.proc_func(forward_batch)
                         else:
                             result = forward_batch.proc_func(forward_batch)

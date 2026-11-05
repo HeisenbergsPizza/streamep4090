@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import itertools
+import json
+import hashlib
 import multiprocessing as mp
 import os
 import random
@@ -8,6 +10,7 @@ import sys
 import time
 import atexit
 from typing import Any, Dict, List
+from types import SimpleNamespace
 from collections.abc import Callable
 
 
@@ -17,12 +20,14 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import sim_sync
-import sim_tbo
-try:
-    import sim_async  # type: ignore
-except ModuleNotFoundError:
-    sim_async = None  # type: ignore
+if __package__:
+    from . import sim_sync, sim_tbo, sim_async
+    from .overheads import BatchOverheadModel, overhead_config_from_args
+else:
+    import sim_sync
+    import sim_tbo
+    import sim_async
+    from overheads import BatchOverheadModel, overhead_config_from_args
 
 
 def _parse_int_list_env(name: str, default: List[int]) -> List[int]:
@@ -61,21 +66,21 @@ def _resolve_gating_profile_path() -> str:
 # ============================================================
 
 # ATTN_SERVICE_T_VALUES = [1, 2, 4]
-ATTN_SERVICE_T_VALUES = [0.1, 0.2, 0.4]
+ATTN_SERVICE_T_VALUES = [float(x) for x in os.environ.get("ATTN_SERVICE_TIMES", "0.1,0.2,0.4").split(",")]
 # EP_GROUP_SIZE_VALUES = [8, 16, 32]
-EP_GROUP_SIZE_VALUES = [32]
-GLOBAL_BATCH_MULTIPLIERS = [128, 256]
+EP_GROUP_SIZE_VALUES = _parse_int_list_env("EP_GROUP_SIZES", [4])
+GLOBAL_BATCH_MULTIPLIERS = _parse_int_list_env("GLOBAL_BATCH_MULTIPLIERS", [128, 256])
 
 # Simple topology model:
 # - GPUs [0..N_GPU_PER_HOST-1] are on host 0, [N_GPU_PER_HOST..2*N_GPU_PER_HOST-1] on host 1, etc.
 # - Network delay depends on whether src/dst GPUs are on the same host.
-N_GPU_PER_HOST = 4
+N_GPU_PER_HOST = int(os.environ.get("N_GPU_PER_HOST", "4"))
 NET_DELAY_VALUES_INTRA_HOST = [0.04]
 NET_DELAY_VALUES_INTER_HOST = [0.08]
 
 # Toggle bandwidth-aware (congestion-modeled) network simulation.
 # When True, transfer times are computed from data size and link bandwidth with
-# receiver-side fair-sharing.  When False, fixed per-hop delays are used.
+# receiver-side FIFO serialization.  When False, fixed per-hop delays are used.
 # Both values are swept in the experiment grid so results can be compared.
 ENBALE_BANDWIDTH_UNAWARE_COMPARISON = False
 ENABLE_BANDWIDTH_AWARE_NETWORK_VALUES = (
@@ -92,17 +97,42 @@ MODEL_NUM_EXPERTS = int(os.environ.get("MODEL_NUM_EXPERTS", "128") or "128")
 HIDDEN_DIM_VALUES = _parse_int_list_env("MODEL_HIDDEN_DIMS", default=[2880])  # bytes/token for comm model
 BYTES_PER_ELEMENT = 2                      # FP16 = 2 bytes
 INTRA_NODE_BANDWIDTH_GBPS = 800.0          # NVLink bandwidth (Gb/s)
-INTER_NODE_BANDWIDTH_VALUES = [50, 100, 200]   # InfiniBand/RoCE bandwidth (Gb/s) to sweep
+INTER_NODE_BANDWIDTH_VALUES = _parse_int_list_env("INTER_NODE_BANDWIDTHS", [200])   # InfiniBand/RoCE bandwidth (Gb/s) to sweep
 TICKS_PER_MILLISECOND = 10                 # Conversion factor for simulation time
 
-MAX_WORKERS = 56
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "1"))
+TOTAL_REQUESTS = int(os.environ.get("TOTAL_REQUESTS", "8192"))
+TOKENS_PER_REQUEST = int(os.environ.get("TOKENS_PER_REQUEST", "256"))
+RNG_SEED = int(os.environ.get("RNG_SEED", "42"))
+SCHEDULING_POLICY = os.environ.get("SCHEDULING_POLICY", "defrag")
+MAX_ATTENTION_BATCH_SIZE = int(os.environ.get("MAX_ATTENTION_BATCH_SIZE", "160"))
+EXPERT_COST_SCALE = float(os.environ.get("EXPERT_COST_SCALE", "1.0"))
+ATTENTION_PROFILE = os.environ.get("ATTENTION_PROFILE") or None
+GROUPED_PROFILE = os.environ.get("GROUPED_PROFILE") or None
+INITIAL_CONTEXT_LENGTH = int(os.environ.get("INITIAL_CONTEXT_LENGTH", "0"))
+
+
+def _optional_float_env(name):
+    raw = (os.environ.get(name) or "").strip()
+    return float(raw) if raw else None
+
+
+# Resolve and validate before workers create output files. Empty optional values
+# retain the same stage-specific/default assumptions as the newer CLI.
+OVERHEAD_CONFIG = overhead_config_from_args(SimpleNamespace(
+    overhead_model=os.environ.get("OVERHEAD_MODEL", "none"),
+    cpu_schedule_scale=float(os.environ.get("CPU_SCHEDULE_SCALE", "1")),
+    cpu_schedule_overlap=_optional_float_env("CPU_SCHEDULE_OVERLAP"),
+    reformation_compute_ratio=_optional_float_env("REFORMATION_COMPUTE_RATIO"),
+    reformation_overlap=float(os.environ.get("REFORMATION_OVERLAP", "0")),
+))
 
 # Enable early termination once max concurrent active requests is hit.
-ENABLE_EARLY_TERMINATION_AFTER_MAX_BS = True
+ENABLE_EARLY_TERMINATION_AFTER_MAX_BS = os.environ.get("EARLY_TERMINATION", "1") == "1"
 
 # Once max concurrent active requests is first reached, let this many additional
 # tokens complete before stopping and reporting metrics.
-TOKENS__AFTER_REACHING_MAX_BS = 8000
+TOKENS__AFTER_REACHING_MAX_BS = int(os.environ.get("TOKENS_AFTER_SATURATION", "8000"))
 
 # Optional: record a short post-saturation schedule timeline for the TBO simulator.
 # Set env var `TBO_TIMELINE_CAPTURE_OPS` (e.g. "100") to enable.
@@ -127,10 +157,13 @@ _PER_TOKEN_STATS_RNG: random.Random | None = None
 _PER_TOKEN_STATS_SAMPLING_RATE: float = 0.0
 
 
+def _results_dir() -> str:
+    return os.path.abspath(os.environ.get("SIM_OUTPUT_DIR") or os.path.dirname(__file__))
+
+
 def _per_token_stats_dir() -> str:
-    # Always place logs under ./simulation/per-token-stats (repo-relative),
-    # regardless of the current working directory.
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "per-token-stats")
+    # Resolve independently of cwd, with an optional SIM_OUTPUT_DIR override.
+    return os.path.join(_results_dir(), "per-token-stats")
 
 
 def _close_per_token_stats_file() -> None:
@@ -174,15 +207,16 @@ def _init_worker_per_token_stats(mode: str, enabled: bool, sampling_rate: float)
     )
     _PER_TOKEN_STATS_F.flush()
 
-    seed = (os.getpid() << 16) ^ int(time.time() * 1_000_000)
-    _PER_TOKEN_STATS_RNG = random.Random(seed)
+    _PER_TOKEN_STATS_RNG = random.Random(RNG_SEED)
     _PER_TOKEN_STATS_SAMPLING_RATE = sampling_rate
 
     atexit.register(_close_per_token_stats_file)
 
 
 def _per_token_stats_begin_sample(token: Any) -> None:
-    rng = _PER_TOKEN_STATS_RNG
+    # Per-token deterministic sampling is independent of process assignment.
+    seed = (RNG_SEED << 64) ^ (int(token.request_id) << 32) ^ int(token.token_index)
+    rng = random.Random(seed) if _PER_TOKEN_STATS_RNG is not None else None
     if rng is None:
         return
     rate = _PER_TOKEN_STATS_SAMPLING_RATE
@@ -210,7 +244,10 @@ def _per_token_stats_log_if_sampled(
     if not bool(getattr(token, "sampled_for_stats", False)):
         return
 
-    latency_ticks = completion_time - float(getattr(token, "birth_time", 0.0))
+    previous = getattr(token, "previous_completion_time", None)
+    if previous is None:  # first output has no inter-token interval
+        return
+    latency_ticks = completion_time - float(previous)
     latency_ms = latency_ticks / float(ticks_per_ms) if ticks_per_ms else 0.0
 
     worker_name = mp.current_process().name
@@ -239,31 +276,50 @@ def _per_token_stats_log_if_sampled(
     )
 
 
-def _format_int_matrix(matrix: List[List[int]]) -> str:
-    if not matrix:
-        return "<empty>\n"
-    cols = max((len(r) for r in matrix), default=0)
-    col_width = max(2, max((len(str(v)) for r in matrix for v in r), default=1))
-    lines = []
-    for i, row in enumerate(matrix):
-        padded = row + [0] * max(0, cols - len(row))
-        cells = " ".join(f"{v:{col_width}d}" for v in padded)
-        lines.append(f"L{i:02d}: {cells}")
-    return "\n".join(lines) + "\n"
+def _persist_run_result(mode, cfg, result):
+    """Keep full research metrics alongside the historical plotting schema."""
+    metadata = {
+        "mode": mode, "config": cfg,
+        "policy": SCHEDULING_POLICY if mode == "async" else mode,
+        "seed": RNG_SEED, "total_requests": TOTAL_REQUESTS,
+        "tokens_per_request": TOKENS_PER_REQUEST,
+        "num_layers": MODEL_NUM_LAYERS, "num_experts": MODEL_NUM_EXPERTS,
+        "top_k": MODEL_ROUTING_TOPK, "expert_cost_scale": EXPERT_COST_SCALE,
+        "expert_profile": _resolve_expert_cost_profile_path(),
+        "routing_profile": _resolve_gating_profile_path(),
+        "attention_profile": ATTENTION_PROFILE, "grouped_profile": GROUPED_PROFILE,
+        "initial_context_length": INITIAL_CONTEXT_LENGTH,
+        "overhead_config": OVERHEAD_CONFIG,
+        "cost_assumptions": {"batch_overhead": BatchOverheadModel(
+            ticks_per_millisecond=TICKS_PER_MILLISECOND, **OVERHEAD_CONFIG).describe()},
+        "max_attention_batch_size": MAX_ATTENTION_BATCH_SIZE,
+        "early_termination": ENABLE_EARLY_TERMINATION_AFTER_MAX_BS,
+        "tokens_after_saturation": TOKENS__AFTER_REACHING_MAX_BS,
+        "network_model": "receive_fifo_bytes_over_bandwidth" if cfg["bw_aware"] else "fixed_remote_delay_no_contention",
+        "network_note": "Fixed-delay columns are unused in bandwidth mode; fixed mode uses inter_host delay for all remote GPUs.",
+        "throughput_note": "avg_throughput_req_per_sec counts completed tokens divided by output length; completed_requests_per_sec counts whole requests.",
+    }
+    for name in ("DEFRAG_LOOKAHEAD", "DEFRAG_LOOKBACK", "DEFRAG_WEIGHT_DECAY"):
+        metadata[name] = os.environ.get(name, {"DEFRAG_LOOKAHEAD": "4", "DEFRAG_LOOKBACK": "4", "DEFRAG_WEIGHT_DECAY": "0.8"}[name])
+    digest = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:16]
+    folder = os.path.join(_results_dir(), "run-details")
+    os.makedirs(folder, exist_ok=True)
+    output = os.path.join(folder, f"{mode}_{metadata['policy']}_{digest}.json")
 
+    def safe(value):
+        if isinstance(value, float) and not (value == value and abs(value) != float("inf")):
+            return None
+        if isinstance(value, dict):
+            return {key: safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [safe(item) for item in value]
+        return value
 
-def _format_optional_float_matrix(matrix: List[List[float | None]]) -> str:
-    if not matrix:
-        return "<empty>\n"
-    cols = max((len(r) for r in matrix), default=0)
-    lines = []
-    for i, row in enumerate(matrix):
-        padded = row + [None] * max(0, cols - len(row))
-        cells = " ".join(
-            (f"{v:10.3f}" if v is not None else f"{'.':>10}") for v in padded
-        )
-        lines.append(f"L{i:02d}: {cells}")
-    return "\n".join(lines) + "\n"
+    with open(output, "w") as stream:
+        json.dump(safe({"metadata": metadata, "result": {
+            key: value for key, value in result.items() if key != "completion_times"
+        }}), stream, indent=2, allow_nan=False)
+    return output
 
 
 def _build_configs() -> List[Dict[str, Any]]:
@@ -306,6 +362,8 @@ def _make_topology_net_delay_fn(
     net_delay_inter_host = float(net_delay_inter_host)
 
     def net_delay_fn(src_gpu: int, dst_gpu: int) -> float:
+        if src_gpu == dst_gpu:
+            return 0.0
         src_host = int(src_gpu) // n_gpu_per_host
         dst_host = int(dst_gpu) // n_gpu_per_host
         return net_delay_intra_host if src_host == dst_host else net_delay_inter_host
@@ -330,8 +388,8 @@ def _make_bandwidth_aware_delay_fn(
         n_gpu_per_host: Number of GPUs per host for topology
         hidden_dim: Hidden dimension of the model
         bytes_per_elem: Bytes per element (2 for FP16, 4 for FP32)
-        intra_node_bw_gbps: Intra-node bandwidth in GB/s
-        inter_node_bw_gbps: Inter-node bandwidth in GB/s
+        intra_node_bw_gbps: Intra-node bandwidth in Gb/s
+        inter_node_bw_gbps: Inter-node bandwidth in Gb/s
         ticks_per_ms: Conversion factor from ms to simulation ticks
 
     Returns:
@@ -343,6 +401,8 @@ def _make_bandwidth_aware_delay_fn(
     inter_bw_bytes_per_ms = float(inter_node_bw_gbps) * 1e9 / 8.0 / 1000.0  # Gb/s -> bytes/ms
 
     def net_delay_fn(src_gpu: int, dst_gpu: int, num_tokens: int = 1) -> float:
+        if src_gpu == dst_gpu:
+            return 0.0
         src_host = int(src_gpu) // n_gpu_per_host
         dst_host = int(dst_gpu) // n_gpu_per_host
 
@@ -408,15 +468,31 @@ def _run_async_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         total_expert_count=MODEL_NUM_EXPERTS,
         num_layers=MODEL_NUM_LAYERS,
         routing_top_k=MODEL_ROUTING_TOPK,
+        total_requests=TOTAL_REQUESTS,
+        tokens_per_request=TOKENS_PER_REQUEST,
+        rng_seed=RNG_SEED,
+        max_attention_batch_size=MAX_ATTENTION_BATCH_SIZE,
+        expert_cost_scale=EXPERT_COST_SCALE,
+        overhead_config=OVERHEAD_CONFIG,
+        hidden_dim=cfg["hidden_dim"], bytes_per_element=BYTES_PER_ELEMENT,
+        attention_profile_path=ATTENTION_PROFILE,
+        grouped_profile_path=GROUPED_PROFILE,
+        initial_context_length=INITIAL_CONTEXT_LENGTH,
         expert_profile_path=_resolve_expert_cost_profile_path(),
         profile_routing_path=_resolve_gating_profile_path(),
         tokens_after_reaching_max_bs=tokens_after_reaching_max_bs,
         enable_defrag_v0_debug_log=ENABLE_DEFRAG_V0_DEBUG_LOG,
+        scheduling_policy=SCHEDULING_POLICY,
+        defrag_lookahead_steps=int(os.environ.get("DEFRAG_LOOKAHEAD", "4")),
+        defrag_lookback_steps=int(os.environ.get("DEFRAG_LOOKBACK", "4")),
+        defrag_weight_decay=float(os.environ.get("DEFRAG_WEIGHT_DECAY", "0.8")),
         per_token_begin_cb=per_token_begin_cb,
         per_token_stats_cb=per_token_stats_cb,
         net_delay_fn=net_delay_fn,
         n_gpu_per_host=cfg["n_gpu_per_host"],
     )
+
+    _persist_run_result("async", cfg, result)
 
     ticks_per_ms = sim_async.TICKS_PER_MILLISECOND
     avg_latency_ms = (
@@ -434,49 +510,10 @@ def _run_async_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     debug_text = None
     if ENABLE_DEFRAG_V0_DEBUG_LOG and result.get("defrag_v0_debug_triggered"):
         entry = result.get("defrag_v0_debug_entry") or {}
-        queue_len_matrix = entry.get("queue_len_matrix") or []
-        score_matrix = entry.get("score_matrix") or []
-        layer_totals = entry.get("layer_totals")
-        lookahead_scores_by_layer = entry.get("lookahead_scores_by_layer")
-
-        debug_lines = [
-            "=== defrag_v0_debug (async) ===",
-            f"config: {cfg}",
-            f"trigger_time={result.get('defrag_v0_debug_trigger_time')}, "
-            f"log_time={entry.get('log_time')}, worker_idx={entry.get('worker_idx')}",
-            f"active_requests_at_log_time={entry.get('active_requests_at_log_time')}, "
-            f"pending_queue_len_at_log_time={entry.get('pending_queue_len_at_log_time')}",
-            f"global_expert_queued_tokens={entry.get('global_expert_queued_tokens')}, "
-            f"global_expert_inflight_tokens={entry.get('global_expert_inflight_tokens')}, "
-            f"global_expert_total_tokens={entry.get('global_expert_total_tokens')}",
-            f"attention_users={entry.get('attention_users')}, attention_queue={entry.get('attention_queue')}",
-            f"pending_tokens_total={entry.get('pending_tokens_total')}",
-            f"pending_tokens_per_layer={entry.get('pending_tokens_per_layer')}",
-            f"tokens_created={entry.get('tokens_created')}, tokens_completed={entry.get('tokens_completed')}, "
-            f"tokens_inflight_unique={entry.get('tokens_inflight_unique')}",
-            f"per_worker_expert_queued_tokens={entry.get('per_worker_expert_queued_tokens')}",
-            f"per_worker_expert_inflight_tokens={entry.get('per_worker_expert_inflight_tokens')}",
-            f"params: weight_decay={entry.get('weight_decay')}, lookahead_steps={entry.get('lookahead_steps')}",
-        ]
-        if layer_totals is not None:
-            debug_lines.append(f"layer_totals: {layer_totals}")
-        if lookahead_scores_by_layer is not None:
-            debug_lines.append(f"lookahead_scores_by_layer: {lookahead_scores_by_layer}")
-        debug_lines.append("")
-        debug_lines.append("queue_len_matrix (layers x groups):")
-        debug_lines.append(_format_int_matrix(queue_len_matrix).rstrip("\n"))
-        debug_lines.append("")
-        debug_lines.append("score_matrix (layers x groups, '.' = empty queue):")
-        debug_lines.append(_format_optional_float_matrix(score_matrix).rstrip("\n"))
-        debug_lines.append("")
-        debug_lines.append(
-            "best: "
-            f"layer={entry.get('best_layer_idx')}, "
-            f"group={entry.get('best_group_idx')}, "
-            f"score={entry.get('best_score')}"
-        )
-        debug_lines.append("")
-        debug_text = "\n".join(debug_lines)
+        debug_text = json.dumps({
+            "config": cfg, "scheduling_policy": SCHEDULING_POLICY,
+            "last_schedule_after_saturation": entry,
+        }, indent=2)
 
     summary: Dict[str, Any] = {
         "mode": "async",
@@ -547,6 +584,15 @@ def _run_sync_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         total_expert_count=MODEL_NUM_EXPERTS,
         num_layers=MODEL_NUM_LAYERS,
         routing_top_k=MODEL_ROUTING_TOPK,
+        total_requests=TOTAL_REQUESTS,
+        tokens_per_request=TOKENS_PER_REQUEST,
+        rng_seed=RNG_SEED,
+        max_attention_batch_size=MAX_ATTENTION_BATCH_SIZE,
+        expert_cost_scale=EXPERT_COST_SCALE,
+        overhead_config=OVERHEAD_CONFIG,
+        attention_profile_path=ATTENTION_PROFILE,
+        grouped_profile_path=GROUPED_PROFILE,
+        initial_context_length=INITIAL_CONTEXT_LENGTH,
         expert_profile_path=_resolve_expert_cost_profile_path(),
         profile_routing_path=_resolve_gating_profile_path(),
         net_delay_fn=net_delay_fn,
@@ -556,6 +602,8 @@ def _run_sync_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         per_token_begin_cb=per_token_begin_cb,
         per_token_stats_cb=per_token_stats_cb,
     )
+
+    _persist_run_result("sync", cfg, result)
 
     ticks_per_ms = sim_sync.TICKS_PER_MILLISECOND
     avg_latency_ms = (
@@ -650,6 +698,15 @@ def _run_tbo_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         total_expert_count=MODEL_NUM_EXPERTS,
         num_layers=MODEL_NUM_LAYERS,
         routing_top_k=MODEL_ROUTING_TOPK,
+        total_requests=TOTAL_REQUESTS,
+        tokens_per_request=TOKENS_PER_REQUEST,
+        rng_seed=RNG_SEED,
+        max_attention_batch_size=MAX_ATTENTION_BATCH_SIZE,
+        expert_cost_scale=EXPERT_COST_SCALE,
+        overhead_config=OVERHEAD_CONFIG,
+        attention_profile_path=ATTENTION_PROFILE,
+        grouped_profile_path=GROUPED_PROFILE,
+        initial_context_length=INITIAL_CONTEXT_LENGTH,
         expert_profile_path=_resolve_expert_cost_profile_path(),
         profile_routing_path=_resolve_gating_profile_path(),
         net_delay_fn=net_delay_fn,
@@ -659,7 +716,7 @@ def _run_tbo_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         per_token_begin_cb=per_token_begin_cb,
         per_token_stats_cb=per_token_stats_cb,
         timeline_capture_ops=TBO_TIMELINE_CAPTURE_OPS,
-        timeline_out_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "tbo-timeline"),
+        timeline_out_dir=os.path.join(_results_dir(), "tbo-timeline"),
         timeline_basename=(
             f"tbo_timeline_ep{cfg['ep_group_size']}"
             f"_gbs{cfg['global_request_max_batch_size']}"
@@ -667,6 +724,8 @@ def _run_tbo_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
             f"_pid{os.getpid()}"
         ),
     )
+
+    _persist_run_result("tbo", cfg, result)
 
     ticks_per_ms = sim_tbo.TICKS_PER_MILLISECOND
     avg_latency_ms = (
@@ -721,7 +780,8 @@ def _run_tbo_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _write_results(mode: str, results: List[Dict[str, Any]]) -> None:
-    results_dir = os.path.dirname(os.path.abspath(__file__))
+    results_dir = _results_dir()
+    os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, f"experiment_results_{mode}.txt")
 
     header = (
@@ -778,7 +838,7 @@ def _write_results(mode: str, results: List[Dict[str, Any]]) -> None:
             )
             f.write(line)
 
-    print(f"Wrote results for mode='{mode}' to {out_path}")
+    print(f"Wrote results for mode='{mode}' to {out_path}; full metrics under {_results_dir()}/run-details")
 
 
 def main(argv: List[str]) -> None:
@@ -799,9 +859,12 @@ def main(argv: List[str]) -> None:
         f"ENBALE_BANDWIDTH_UNAWARE_COMPARISON={ENBALE_BANDWIDTH_UNAWARE_COMPARISON} "
         f"MODEL_HIDDEN_DIMS={HIDDEN_DIM_VALUES} "
         f"EXPERT_COST_PROFILE={profile_path} "
-        f"GATING_PROFILE={gating_profile_path}"
+        f"GATING_PROFILE={gating_profile_path} "
+        f"OVERHEAD_CONFIG={OVERHEAD_CONFIG}"
     )
     configs = _build_configs()
+    if MAX_WORKERS < 1:
+        raise ValueError("MAX_WORKERS must be >= 1")
     num_workers = min(MAX_WORKERS, len(configs))
 
     if mode == "async":
@@ -811,7 +874,8 @@ def main(argv: List[str]) -> None:
     else:
         worker_fn = _run_tbo_config
 
-    results_dir = os.path.dirname(os.path.abspath(__file__))
+    results_dir = _results_dir()
+    os.makedirs(results_dir, exist_ok=True)
     out_path = os.path.join(results_dir, f"experiment_results_{mode}.txt")
     debug_path = os.path.join(results_dir, DEFRAG_V0_DEBUG_LOG_BASENAME)
 
@@ -887,7 +951,7 @@ def main(argv: List[str]) -> None:
             if debug_f is not None:
                 debug_f.close()
 
-    print(f"Wrote results for mode='{mode}' to {out_path}")
+    print(f"Wrote results for mode='{mode}' to {out_path}; full metrics under {_results_dir()}/run-details")
     if mode == "async" and ENABLE_DEFRAG_V0_DEBUG_LOG:
         print(f"Wrote defrag-v0 debug log (text) to {debug_path}")
     if ENABLE_PER_TOKEN_STATS:

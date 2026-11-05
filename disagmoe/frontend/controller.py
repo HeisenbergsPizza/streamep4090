@@ -4,6 +4,7 @@ ray = importlib.import_module("ray")
 import torch
 import os
 import asyncio
+import time
 
 PlacementGroupSchedulingStrategy = importlib.import_module(
     "ray.util.scheduling_strategies"
@@ -58,6 +59,9 @@ class Controller:
         self.is_polling = False
         self._poll_error = None
         self._max_cache_blocks = None
+        self._synchronized_start_gate = None
+        self._synchronized_start_responses = []
+        self.synchronized_start_report = None
         self.enable_nsys = enable_nsys
         self.expert_wise_schedule = expert_wise_schedule
         self.host_ifname = host_ifname
@@ -435,6 +439,137 @@ class Controller:
         )
         return res
     
+    async def prepare_synchronized_start(self, num_requests, input_len, output_len, timeout_s=120.0):
+        """Reserve balanced requests and wait until every initial GPU batch is prepared."""
+        from disagmoe.utils.synchronized_start import create_gate, validate_capacity
+
+        if self._poll_error is not None:
+            raise RuntimeError("Inference service has failed") from self._poll_error
+        if self._synchronized_start_gate is not None or self.synchronized_start_report is not None:
+            raise RuntimeError("Only one synchronized cohort is supported per launch")
+        dp_size = self.model_config.dp_size
+        if num_requests <= 0 or num_requests % dp_size or len(self.workers) != dp_size:
+            raise ValueError("Synchronized cohort needs equal nonempty batches and one worker per DP rank")
+        if self.in_flight_reqs or not self.dp_scheduler.waiting_queue.empty():
+            raise RuntimeError("Warmup and request admission must be drained before preparing the cohort")
+        ranks = [self.model_place.attn_dp_rank_at(d) for d in self.device_ids]
+        if sorted(ranks) != list(range(dp_size)):
+            raise ValueError("Each synchronized worker must own a distinct attention DP rank")
+        identities = await asyncio.wait_for(asyncio.gather(*[
+            worker.get_worker_identity.remote(self.host_ifname) for worker in self.workers
+        ]), timeout_s)
+        if len({item["ray_node_id"] for item in identities}) != 1:
+            raise ValueError("The common start clock and gate require a single Ray node")
+        if identities[0]["ray_node_id"] != str(ray.get_runtime_context().get_node_id()):
+            raise ValueError("The synchronized-start driver must run on the GPU workers' node")
+        validate_request_lengths(input_len, output_len, self.model_config.max_seq_len,
+                                 self.cache_config.block_size, self._max_cache_blocks)
+        count = num_requests // dp_size
+        blocks = self.dp_scheduler.required_blocks(input_len, output_len)
+        # Check the full cohort on EVERY rank before allocating a single ID.
+        validate_capacity(self.dp_scheduler.kv_cache_stats, blocks, count)
+        gate = create_gate()
+        self._synchronized_start_gate = gate
+        cohorts = [[] for _ in range(dp_size)]
+        self._synchronized_start_responses = []
+        try:
+            for rank in range(dp_size):
+                for _ in range(count):
+                    req_id = self.get_new_req_id()
+                    response = AsyncResult(req_id)
+                    self.request_results[req_id] = response
+                    self._synchronized_start_responses.append(response)
+                    self.dp_scheduler.add_seq(req_id, input_len, output_len, rank)
+                    cohorts[rank].append(dict(req_id=req_id, input_len=input_len, output_len=output_len))
+            await asyncio.wait_for(asyncio.gather(*[
+                worker.arm_synchronized_start.remote(gate, cohorts[rank])
+                for worker, rank in zip(self.workers, ranks)
+            ]), timeout_s)
+            deadline = time.perf_counter() + timeout_s
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out preparing the initial attention batches")
+                statuses = await asyncio.wait_for(self._get_synchronized_start_statuses(), remaining)
+                if self._poll_error is not None:
+                    raise RuntimeError("Inference service failed while preparing the cohort") from self._poll_error
+                if all(status["state"] == "ready" for status in statuses):
+                    break
+                await asyncio.sleep(0.01)
+            self.synchronized_start_report = {
+                "run_id": gate["run_id"], "clock": "time.perf_counter_ns",
+                "workload": "synthetic decode; random weights and hidden states; routing follows runtime configuration",
+                "num_requests": num_requests, "initial_batch_per_rank": count,
+                "input_len": input_len, "output_len": output_len,
+                "workers": statuses, "worker_identities": identities,
+                "timing_window": "common release deadline to all responses received; preparation excluded",
+            }
+            return list(self._synchronized_start_responses)
+        except BaseException:
+            try:
+                await self.abort_synchronized_start()
+            except Exception:
+                get_logger().exception("Could not fully clean up the failed synchronized cohort")
+            raise
+
+    async def _get_synchronized_start_statuses(self):
+        statuses = await asyncio.gather(*[
+            worker.get_synchronized_start_status.remote() for worker in self.workers])
+        for status in statuses:
+            if status["state"] == "failed":
+                raise RuntimeError(f"Synchronized start failed on device {status.get('device_id')}: "
+                                   f"{status.get('error')}")
+        return statuses
+
+    async def release_synchronized_start(self):
+        from disagmoe.utils.synchronized_start import publish_gate
+
+        statuses = await asyncio.wait_for(self._get_synchronized_start_statuses(), 10.0)
+        if not all(status["state"] == "ready" for status in statuses):
+            raise RuntimeError("All workers must still be ready before release")
+        gate = self._synchronized_start_gate
+        release = publish_gate(gate["directory"], gate["run_id"])
+        self.synchronized_start_report.update(release)
+        return release["release_ns"]
+
+    async def finish_synchronized_start(self):
+        from disagmoe.utils.synchronized_start import cleanup_gate
+
+        statuses = await asyncio.wait_for(self._get_synchronized_start_statuses(), 10.0)
+        if not all(status["state"] == "executed" for status in statuses):
+            raise RuntimeError("Initial attention execution was not recorded on every worker")
+        starts = [status["execute_begin_ns"] for status in statuses]
+        self.synchronized_start_report.update(
+            workers=statuses, cpu_start_skew_ms=(max(starts) - min(starts)) / 1e6)
+        cleanup_gate(self._synchronized_start_gate["directory"])
+        self._synchronized_start_gate = None
+
+    async def abort_synchronized_start(self):
+        """Cancel this one-shot experiment and undo controller-side reservations."""
+        from disagmoe.utils.synchronized_start import cleanup_gate
+
+        if self._synchronized_start_gate is None:
+            return
+        await self.stop_polling_results()
+        try:
+            await asyncio.wait_for(asyncio.gather(*[
+                worker.cancel_synchronized_start.remote() for worker in self.workers
+            ], return_exceptions=True), 5.0)
+        except Exception:
+            get_logger().exception("Could not acknowledge cancellation on every worker")
+        finally:
+            try:
+                cleanup_gate(self._synchronized_start_gate["directory"])
+            finally:
+                self._synchronized_start_gate = None
+                for response in self._synchronized_start_responses:
+                    req_id = response.req_id
+                    if req_id in self.dp_scheduler.seq_ranks:
+                        self.dp_scheduler.del_seq(req_id)
+                    self.in_flight_reqs.discard(req_id)
+                    self.request_results.pop(req_id, None)
+                    await response.fail(RuntimeError("Synchronized-start experiment aborted"))
+
     def get_pool_snapshot(self) -> List[List[int]]:
         return ray.get([worker.get_pool_snapshot.remote() for worker in self.workers])
     

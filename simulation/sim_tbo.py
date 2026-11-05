@@ -5,14 +5,22 @@ import os
 import random
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, List, Tuple
 
 import torch
 
-from util import expert_compute_time_lookup_table_from_profile, build_profile_router
-from disagmoe.models.gate import ProfileDrivenRouter
+try:
+    from .util import expert_compute_time_lookup_table_from_profile, build_profile_router
+    from .router import ProfileDrivenRouter
+    from .costs import ExpertCostModel, AttentionCostModel
+    from .overheads import BatchOverheadModel
+except ImportError:  # Direct invocation from the simulation directory.
+    from util import expert_compute_time_lookup_table_from_profile, build_profile_router
+    from router import ProfileDrivenRouter
+    from costs import ExpertCostModel, AttentionCostModel
+    from overheads import BatchOverheadModel
 
 
 # ------------------------------
@@ -36,8 +44,6 @@ TICKS_PER_MILLISECOND = 10  # 0.1 ms per tick
 
 NET_T_EXPERT_TO_ATTN = 0.1  # fixed network delay expert -> attention in #ticks, 10us
 NET_T_ATTN_TO_EXPERT = 0.1  # fixed network delay attention -> expert in #ticks, 10us
-
-GROUP_GEMM_SPEEDUP_FACTOR = 0.7  # speedup factor for grouped GEMM vs single-expert profile
 
 RNG_SEED = 42
 
@@ -74,6 +80,7 @@ class Token:
     home_gpu: int = 0
     layer_fanout: Dict[int, int] = field(default_factory=dict)
     sampled_for_stats: bool = False
+    previous_completion_time: float | None = None
 
 
 @dataclass
@@ -83,6 +90,7 @@ class RequestState:
     home_gpu: int | None = None
     next_token_index: int = 0
     completed: bool = False
+    last_completion_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -394,6 +402,12 @@ class TBOMoESimulator:
         per_token_begin_cb: Callable[[Token], None] | None = None,
         per_token_stats_cb: Callable[[Token, float], None] | None = None,
         timeline_capture: TimelineCapture | None = None,
+        expert_cost_model: ExpertCostModel | None = None,
+        attention_cost_model: AttentionCostModel | None = None,
+        max_attention_batch_size: int = 160,
+        initial_context_length: int = 0,
+        finalize_per_token_t: float = 0.0,
+        overhead_model: BatchOverheadModel | None = None,
     ):
         if total_expert_count % ep_group_size != 0:
             raise ValueError("total_expert_count must be divisible by ep_group_size")
@@ -410,12 +424,27 @@ class TBOMoESimulator:
         self.net_delay_fn = net_delay_fn
         self.n_gpu_per_host = max(1, int(n_gpu_per_host)) if n_gpu_per_host is not None else None
         self.compute_time_lookup = compute_time_lookup
+        self.expert_cost_model = expert_cost_model or ExpertCostModel(compute_time_lookup)
+        self.attention_cost_model = attention_cost_model or AttentionCostModel(attn_service_t)
+        self.overhead_model = overhead_model or BatchOverheadModel()
+        self.overhead_batch_counts = Counter()
+        self.overhead_planned_ticks = {stage: Counter() for stage in ("attention", "expert")}
+        self.max_attention_batch_size = int(max_attention_batch_size)
+        self.initial_context_length = int(initial_context_length)
+        self.finalize_per_token_t = float(finalize_per_token_t)
+        if self.finalize_per_token_t < 0 or not math.isfinite(self.finalize_per_token_t):
+            raise ValueError("finalize_per_token_t must be finite and nonnegative")
+        if self.max_batch_size <= 0 or self.max_attention_batch_size <= 0:
+            raise ValueError("expert and attention batch caps must be positive")
+        if self.initial_context_length < 0:
+            raise ValueError("initial_context_length must be nonnegative")
         self.profile_router = profile_router
         self.progress_tracker = progress_tracker
         self.global_request_max_batch_size = max(1, int(global_request_max_batch_size))
         self.per_token_begin_cb = per_token_begin_cb
         self.per_token_stats_cb = per_token_stats_cb
         self.timeline_capture = timeline_capture
+        self._layer_comm_transfers: Dict[tuple[int, int, str], List[tuple[int, int, float]]] = {}
 
         self.total_requests = len(request_arrivals)
         self.expected_total_tokens = self.total_requests * self.tokens_per_request
@@ -452,6 +481,8 @@ class TBOMoESimulator:
         # Batch size statistics (per expert compute invocation)
         self.total_expert_batch_size: float = 0.0
         self.total_expert_batch_count: int = 0
+        self.total_expert_group_batch_size: float = 0.0
+        self.total_expert_group_batch_count: int = 0
 
     def run(self, tokens_after_reaching_max_bs: int | None = None):
         steps_executed = 0
@@ -582,11 +613,18 @@ class TBOMoESimulator:
             "avg_layer_wait_imbalance": avg_layer_wait_imbalance,
             "avg_layer_worker_queue_stddev": avg_layer_worker_queue_stddev,
             "avg_per_expert_batch_size": avg_per_expert_batch_size,
+            "avg_expert_group_batch_size": (
+                self.total_expert_group_batch_size / self.total_expert_group_batch_count
+                if self.total_expert_group_batch_count else 0.0
+            ),
+            "completed_tokens": self.completed_tokens,
+            "completed_requests": len(self.request_latency_values),
             "stopped_early": stopped_early,
             "steps_executed": steps_executed,
             "saturation_step": saturation_step,
             "saturation_tokens_completed": saturation_tokens_completed,
             "saturation_time": saturation_time,
+            "batch_overhead_accounting": self._batch_overhead_accounting(),
             "timeline_capture_started": bool(capture.started) if capture is not None else False,
             "timeline_ops_recorded": len(capture.ops) if capture is not None else 0,
         }
@@ -641,6 +679,7 @@ class TBOMoESimulator:
                 request_id=request.request_id,
                 token_index=request.next_token_index,
                 home_gpu=int(request.home_gpu),
+                previous_completion_time=request.last_completion_time,
             )
             self.next_tid += 1
             if begin_cb is not None:
@@ -676,7 +715,9 @@ class TBOMoESimulator:
         # Task kinds:
         # - compute: consumes the single-capacity compute resource
         # - dispatch/combine: launches an async transfer (in-flight), may block later if not finished
-        tasks: List[List[tuple[str, float, str, int]]] = [[], []]  # (kind, dur, stage, layer_idx) per microbatch
+        # Communication tasks carry individual transfers so both microbatches
+        # compete for the same destination receive channels at launch time.
+        tasks: List[List[tuple]] = [[], []]
 
         for layer_idx in range(self.num_layers):
             layer_times = self._compute_layer_times(layer_idx, tokens, tid_to_mb)
@@ -684,9 +725,17 @@ class TBOMoESimulator:
             for mb in (0, 1):
                 attn_t, dispatch_t, expert_compute_t, combine_t = layer_times[mb]
                 tasks[mb].append(("compute", attn_t, "attn", layer_idx))
-                tasks[mb].append(("dispatch", dispatch_t, "dispatch", layer_idx))
+                tasks[mb].append(("dispatch", dispatch_t, "dispatch", layer_idx,
+                                  (self._layer_comm_transfers[(layer_idx, mb, "dispatch")]
+                                   if self.net_delay_fn is not None else None)))
                 tasks[mb].append(("compute", expert_compute_t, "expert", layer_idx))
-                tasks[mb].append(("combine", combine_t, "combine", layer_idx))
+                tasks[mb].append(("combine", combine_t, "combine", layer_idx,
+                                  (self._layer_comm_transfers[(layer_idx, mb, "combine")]
+                                   if self.net_delay_fn is not None else None)))
+
+        for mb, mb_tokens in enumerate((mb0, mb1)):
+            if self.finalize_per_token_t > 0:
+                tasks[mb].append(("compute", self._finalize_time(mb_tokens), "finalize", self.num_layers))
 
         finish0, finish1 = self._schedule_resources(
             tasks[0],
@@ -694,6 +743,7 @@ class TBOMoESimulator:
             step_idx=int(step_idx),
             iteration_base_time=float(iteration_base_time),
             timeline_capture=timeline_capture,
+            n_gpu_per_host=self.n_gpu_per_host,
         )
         makespan = max(finish0, finish1)
 
@@ -716,18 +766,8 @@ class TBOMoESimulator:
         tid_to_mb: Dict[int, int],
     ) -> List[tuple[float, float, float, float]]:
         # Returns per-microbatch (attn, dispatch, expert_compute, combine_comm)
-        token_count_mb = [0, 0]
-        for token in tokens:
-            token_count_mb[tid_to_mb[token.tid]] += 1
-
-        attn_times = []
-        for mb in (0, 1):
-            n = token_count_mb[mb]
-            if n <= 0 or self.attn_service_t <= 0.0:
-                attn_times.append(0.0)
-            else:
-                batches = math.ceil(n / float(self.attn_dp_group_size))
-                attn_times.append(batches * self.attn_service_t)
+        tokens_by_mb = [[token for token in tokens if tid_to_mb[token.tid] == mb] for mb in (0, 1)]
+        attn_times = [self._attention_time(mb_tokens) for mb_tokens in tokens_by_mb]
 
         # Route once for all tokens; then aggregate per microbatch.
         worker_queues_by_mb: List[List[List[int]]] = [
@@ -784,33 +824,12 @@ class TBOMoESimulator:
 
         out: List[tuple[float, float, float, float]] = []
         for mb in (0, 1):
-            dispatch_time = self.net_t_attn_to_expert
             tokens_per_src_per_dst = tokens_per_src_per_dst_by_mb[mb]
-
-            if self.net_delay_fn is not None:
-                # --- Congestion-aware dispatch (dual receive-queue model) ---
-                # Each destination GPU has two independent receive queues:
-                # NVLink (intra-node) and RDMA (inter-node).  Transfers are
-                # serialized within each queue at full link bandwidth, but
-                # the two queues drain in parallel.
-                dst_dispatch_delays: List[float] = []
-                for worker_idx in range(self.ep_group_size):
-                    src_tokens = tokens_per_src_per_dst.get(worker_idx)
-                    if not src_tokens:
-                        dst_dispatch_delays.append(0.0)
-                        continue
-                    nvlink_total = 0.0
-                    rdma_total = 0.0
-                    for src, ntok in src_tokens.items():
-                        if ntok <= 0:
-                            continue
-                        delay = float(self.net_delay_fn(int(src), int(worker_idx), int(ntok)))
-                        if self._is_same_host(src, worker_idx):
-                            nvlink_total += delay
-                        else:
-                            rdma_total += delay
-                    dst_dispatch_delays.append(max(nvlink_total, rdma_total))
-                dispatch_time = max(dst_dispatch_delays) if dst_dispatch_delays else 0.0
+            dispatch_transfers = self._communication_transfers(tokens_per_src_per_dst, reverse=False)
+            return_transfers = self._communication_transfers(tokens_per_src_per_dst, reverse=True)
+            self._layer_comm_transfers[(layer_idx, mb, "dispatch")] = dispatch_transfers
+            self._layer_comm_transfers[(layer_idx, mb, "combine")] = return_transfers
+            dispatch_time = self._communication_duration(dispatch_transfers)
 
             # Record per-worker queue imbalance (stddev over that worker's expert queues).
             for queues in worker_queues_by_mb[mb]:
@@ -822,44 +841,12 @@ class TBOMoESimulator:
 
             # Compute expert processing time (compute only, no return delay).
             worker_compute_times: List[float] = []
-            worker_total_tokens: List[int] = []
             for worker_idx, loads in enumerate(worker_queues_by_mb[mb]):
                 compute_t = self._simulate_worker_compute_time(loads)
                 worker_compute_times.append(compute_t)
-                worker_total_tokens.append(sum(loads))
             expert_compute_time = max(worker_compute_times) if worker_compute_times else 0.0
 
-            # --- Congestion-aware return (dual receive-queue model) ---
-            # Each attention GPU (destination) has NVLink and RDMA receive
-            # queues that drain independently.
-            if self.net_delay_fn is not None:
-                attn_nvlink_delays: Dict[int, float] = {}
-                attn_rdma_delays: Dict[int, float] = {}
-                for worker_idx in range(self.ep_group_size):
-                    if worker_total_tokens[worker_idx] == 0:
-                        continue
-                    src_tokens = tokens_per_src_per_dst.get(worker_idx)
-                    if not src_tokens:
-                        continue
-                    for attn_gpu in src_tokens:
-                        tokens_to_return = src_tokens[attn_gpu]
-                        if tokens_to_return <= 0:
-                            continue
-                        delay = float(self.net_delay_fn(int(worker_idx), int(attn_gpu), int(tokens_to_return)))
-                        if self._is_same_host(worker_idx, attn_gpu):
-                            attn_nvlink_delays[attn_gpu] = attn_nvlink_delays.get(attn_gpu, 0.0) + delay
-                        else:
-                            attn_rdma_delays[attn_gpu] = attn_rdma_delays.get(attn_gpu, 0.0) + delay
-                all_attn_gpus = set(attn_nvlink_delays.keys()) | set(attn_rdma_delays.keys())
-                if all_attn_gpus:
-                    return_comm_time = max(
-                        max(attn_nvlink_delays.get(gpu, 0.0), attn_rdma_delays.get(gpu, 0.0))
-                        for gpu in all_attn_gpus
-                    )
-                else:
-                    return_comm_time = 0.0
-            else:
-                return_comm_time = self.net_t_expert_to_attn
+            return_comm_time = self._communication_duration(return_transfers)
 
             # Per-layer wait imbalance: spread of worker compute runtimes.
             if worker_compute_times:
@@ -878,25 +865,105 @@ class TBOMoESimulator:
         return out
 
     def _simulate_worker_compute_time(self, loads: List[int]) -> float:
-        total_tokens = sum(loads)
-        if total_tokens <= 0:
-            return 0.0
-
+        """Use the same capped local-expert vector as the async worker."""
         queues = list(loads)
         elapsed = 0.0
-        while total_tokens > 0:
-            queue_idx = max(range(len(queues)), key=lambda i: queues[i])
-            available = queues[queue_idx]
-            if available <= 0:
-                break
-            batch = min(available, self.max_batch_size)
-            queues[queue_idx] -= batch
-            total_tokens -= batch
-            compute_t = float(self.compute_time_lookup[batch])
-            elapsed += compute_t
-            self.total_expert_batch_size += batch
-            self.total_expert_batch_count += 1
+        while any(queues):
+            remaining = self.max_batch_size
+            batch_counts = [0] * len(queues)
+            for expert_idx, count in enumerate(queues):
+                take = min(count, remaining)
+                batch_counts[expert_idx] = take
+                queues[expert_idx] -= take
+                remaining -= take
+                if remaining == 0:
+                    break
+            batch_size = sum(batch_counts)
+            compute_ticks = float(self.expert_cost_model(batch_counts))
+            elapsed += self._batch_service_time("expert", compute_ticks, batch_size)
+            self.total_expert_group_batch_size += batch_size
+            self.total_expert_group_batch_count += 1
+            self.total_expert_batch_size += batch_size
+            self.total_expert_batch_count += sum(count > 0 for count in batch_counts)
         return elapsed
+
+    def _attention_time(self, tokens: List[Token]) -> float:
+        """All home GPUs run their own capped layer batches in parallel."""
+        contexts_by_gpu: Dict[int, List[int]] = {}
+        for token in tokens:
+            contexts_by_gpu.setdefault(int(token.home_gpu), []).append(
+                self.initial_context_length + int(token.token_index)
+            )
+        gpu_times = []
+        for contexts in contexts_by_gpu.values():
+            cap = self.max_attention_batch_size
+            gpu_times.append(sum(
+                self._batch_service_time(
+                    "attention", float(self.attention_cost_model(contexts[start:start + cap])),
+                    len(contexts[start:start + cap]))
+                for start in range(0, len(contexts), cap)
+            ))
+        return max(gpu_times, default=0.0)
+
+    def _batch_service_time(self, stage: str, compute_ticks: float, batch_size: int) -> float:
+        """Aggregate exposed costs in the legacy phase, without CPU resources.
+
+        The phase clock contains CPU exposed delay and GPU work. It is not a
+        GPU-busy measurement. Empty batches and terminal finalize bypass this
+        helper; each nonempty capped local batch is charged exactly once.
+        """
+        if not self.overhead_model.enabled:
+            return compute_ticks
+        estimate = self.overhead_model.evaluate(stage, compute_ticks, batch_size=batch_size)
+        if stage != "finalize" and batch_size:
+            self.overhead_batch_counts[stage] += 1
+            self.overhead_planned_ticks[stage].update(estimate.as_dict())
+        return estimate.total_ticks
+
+    def _batch_overhead_accounting(self):
+        return {
+            "scope": "planned local batch estimates including planned work after early stop; not wall-time or GPU busy",
+            "aggregation": "sum across GPUs and batches before per-phase critical-path maxima",
+            "batch_counts": dict(self.overhead_batch_counts),
+            "by_stage_ticks": {stage: dict(values) for stage, values
+                               in self.overhead_planned_ticks.items()},
+        }
+
+    def _finalize_time(self, tokens: List[Token]) -> float:
+        counts: Dict[int, int] = {}
+        for token in tokens:
+            counts[token.home_gpu] = counts.get(token.home_gpu, 0) + 1
+        return max(counts.values(), default=0) * self.finalize_per_token_t
+
+    def _communication_transfers(
+        self, tokens_per_src_per_dst: Dict[int, Dict[int, int]], *, reverse: bool,
+    ) -> List[tuple[int, int, float]]:
+        """One transfer per source/destination, sized in expert token copies."""
+        transfers = []
+        for expert_gpu, source_counts in sorted(tokens_per_src_per_dst.items()):
+            for home_gpu, count in sorted(source_counts.items()):
+                src, dst = (expert_gpu, home_gpu) if reverse else (home_gpu, expert_gpu)
+                if src == dst or count <= 0:
+                    continue
+                if self.net_delay_fn is None:
+                    delay = self.net_t_expert_to_attn if reverse else self.net_t_attn_to_expert
+                else:
+                    delay = float(self.net_delay_fn(src, dst, count))
+                if delay < 0 or not math.isfinite(delay):
+                    raise ValueError("network delay must be finite and nonnegative")
+                if delay > 0:
+                    transfers.append((src, dst, float(delay)))
+        return transfers
+
+    def _communication_duration(self, transfers: List[tuple[int, int, float]]) -> float:
+        if self.net_delay_fn is None:
+            # Fixed-delay mode has no receive contention, matching async.
+            return max((delay for _, _, delay in transfers), default=0.0)
+        receive_times: Dict[tuple[int, bool], float] = {}
+        for src, dst, delay in transfers:
+            key = (dst, self._is_same_host(src, dst))
+            receive_times[key] = receive_times.get(key, 0.0) + delay
+        return max(receive_times.values(), default=0.0)
 
     @staticmethod
     def _schedule_resources(
@@ -906,11 +973,15 @@ class TBOMoESimulator:
         step_idx: int,
         iteration_base_time: float,
         timeline_capture: TimelineCapture | None,
+        n_gpu_per_host: int | None = None,
     ) -> tuple[float, float]:
         tasks = [tasks0, tasks1]
         next_idx = [0, 0]
         ready = [0.0, 0.0]
         compute_free = 0.0
+        # Shared across dispatch/return and both microbatches. Each destination
+        # has independent intra-node and inter-node FIFO receive channels.
+        receive_free: Dict[tuple[int, bool], float] = {}
         inflight_until = [0.0, 0.0]  # per-microbatch async comm completion time
         inflight_src: list[tuple[str, int] | None] = [None, None]  # (stage, layer_idx)
 
@@ -988,16 +1059,29 @@ class TBOMoESimulator:
                         end_time=float(iteration_base_time) + float(end),
                     )
             else:
-                # Async launch: doesn't advance ready time, but starts an in-flight transfer.
+                # Launch every transfer into the common receive-channel model.
                 start = float(est)
-                end = start + dur
+                end = start
+                if len(t) >= 5 and t[4] is not None:
+                    for src, dst, delay in t[4]:
+                        same_host = (n_gpu_per_host is None or
+                                     int(src) // n_gpu_per_host == int(dst) // n_gpu_per_host)
+                        key = (int(dst), same_host)
+                        transfer_start = max(start, receive_free.get(key, 0.0))
+                        transfer_end = transfer_start + float(delay)
+                        receive_free[key] = transfer_end
+                        end = max(end, transfer_end)
+                else:
+                    # Preserve support for existing duration-only task callers.
+                    end = start + dur
                 if end > inflight_until[mb]:
                     inflight_until[mb] = end
                     inflight_src[mb] = (stage, int(layer_idx))
 
             next_idx[mb] += 1
 
-        return ready[0], ready[1]
+        # The final combine has no subsequent compute to force this wait.
+        return max(ready[0], inflight_until[0]), max(ready[1], inflight_until[1])
 
     def _finalize_iteration(self, tokens: List[Token], token_completion_offsets: Dict[int, float]):
         cb = self.per_token_stats_cb
@@ -1013,6 +1097,7 @@ class TBOMoESimulator:
                 cb(token, completion_time)
 
             req = self.request_lookup[token.request_id]
+            req.last_completion_time = completion_time
             req.next_token_index += 1
             if req.next_token_index >= self.tokens_per_request:
                 req.completed = True
@@ -1053,7 +1138,19 @@ def run_simulation(
     timeline_capture_ops: int = 0,
     timeline_out_dir: str | None = None,
     timeline_basename: str | None = None,
+    expert_cost_scale: float = 1.0,
+    grouped_profile_path: str | None = None,
+    max_attention_batch_size: int = 160,
+    attention_profile_path: str | None = None,
+    initial_context_length: int = 0,
+    finalize_per_token_t: float = 0.0,
+    overhead_config: dict | None = None,
 ):
+    overhead_model = BatchOverheadModel(ticks_per_millisecond=ticks_per_millisecond,
+                                       **(overhead_config or {}))
+    if overhead_model.preset == "structural":
+        raise ValueError("structural overhead needs buffer provenance; use "
+                         "sim_async.run_simulation(execution_mode='tbo') or simulation.steady_experiment")
     rng = random.Random(rng_seed)
 
     total_tokens_expected = total_requests * tokens_per_request
@@ -1064,15 +1161,26 @@ def run_simulation(
         max_batch_size,
         ticks_per_millisecond=ticks_per_millisecond,
     )
-    compute_time_lookup: Dict[int, float] = {
-        bs: t * GROUP_GEMM_SPEEDUP_FACTOR for bs, t in base_compute_time_lookup.items()
-    }
+    compute_time_lookup = base_compute_time_lookup
+    expert_cost_model = ExpertCostModel(
+        compute_time_lookup, scale=expert_cost_scale,
+        grouped_profile_path=grouped_profile_path,
+        ticks_per_millisecond=ticks_per_millisecond,
+    )
+    attention_cost_model = AttentionCostModel(
+        attn_service_t, profile_path=attention_profile_path,
+        ticks_per_millisecond=ticks_per_millisecond,
+    )
 
     profile_router = build_profile_router(
         profile_path=profile_routing_path,
         num_experts=total_expert_count,
         top_k=routing_top_k,
     )
+    if num_layers <= 0 or num_layers > profile_router.num_layers:
+        raise ValueError(
+            f"num_layers={num_layers} outside routing trace range 1..{profile_router.num_layers}"
+        )
 
     attn_dp_group_size = max(1, int(attn_dp_group_size))
 
@@ -1101,6 +1209,12 @@ def run_simulation(
         net_delay_fn=net_delay_fn,
         n_gpu_per_host=n_gpu_per_host,
         compute_time_lookup=compute_time_lookup,
+        expert_cost_model=expert_cost_model,
+        attention_cost_model=attention_cost_model,
+        overhead_model=overhead_model,
+        max_attention_batch_size=max_attention_batch_size,
+        initial_context_length=initial_context_length,
+        finalize_per_token_t=finalize_per_token_t,
         profile_router=profile_router,
         progress_tracker=progress_tracker,
         global_request_max_batch_size=global_request_max_batch_size,
@@ -1240,6 +1354,15 @@ def run_simulation(
 
     return {
         "completion_times": completion_times,
+        "attention_cost_model": attention_cost_model.describe(),
+        "batch_overhead_model": overhead_model.describe(),
+        "batch_overhead_accounting": results["batch_overhead_accounting"],
+        "batch_overhead_semantics": {
+            "accounting": "once per nonempty capped local attention/expert batch; terminal finalize excluded",
+            "execution": "exposed CPU and reformation costs aggregated into legacy serialized phase service time; no separate CPU resource",
+            "busy": "compute-lane timeline includes exposed CPU delay and must not be interpreted as GPU busy time",
+            "comparison": "same assumed per-batch costs across modes; not a measured synchronous scheduler cost",
+        },
         "avg_latency": avg_latency,
         "makespan": makespan,
         "avg_layer_runtime": avg_layer_runtime,
@@ -1251,6 +1374,11 @@ def run_simulation(
         "p99_request_latency_ms": p99_request_latency_ms,
         "avg_layer_worker_queue_stddev": avg_layer_worker_queue_stddev,
         "avg_per_expert_batch_size": avg_per_expert_batch_size,
+        "avg_expert_group_batch_size": results["avg_expert_group_batch_size"],
+        "completed_tokens": completed_tokens,
+        "completed_requests": len(request_latency_values),
+        "output_tokens_per_sec": completed_tokens / makespan_sec if makespan_sec > 0 else 0.0,
+        "completed_requests_per_sec": len(request_latency_values) / makespan_sec if makespan_sec > 0 else 0.0,
         "stopped_early": stopped_early,
         "steps_executed": steps_executed,
         "saturation_step": saturation_step,
