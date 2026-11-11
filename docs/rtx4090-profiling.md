@@ -85,6 +85,32 @@ PY
 
 `nvtx_enabled()` 只检查扩展及开关，采集成功仍需查看实际报告。它通过独立的 `DMOE_ENABLE_NVTX=1` 输出 NVIDIA NVTX，保留旧内存 recorder 的 `ENABLE_NVTX=0`。
 
+### 2.1 配置临时目录和报告位置
+
+长时间采集可能产生大量 Nsight 临时数据。开始前检查目标挂载、可用空间和 inode；下面以已确认可写的 `/workspace/zzc` 为例：
+
+```bash
+findmnt -T /workspace
+df -h /tmp /workspace
+df -i /tmp /workspace
+export DMOE_RAY_TMPDIR=/workspace/zzc/ray
+export DMOE_RUNTIME_TMPDIR=/workspace/zzc/streamep4090/tmp
+profile_reports=/workspace/zzc/streamep4090/reports
+mkdir -p "$DMOE_RAY_TMPDIR" "$DMOE_RUNTIME_TMPDIR" "$profile_reports"
+
+# 每次运行通过 PROFILE_RUN_DIR 指定一个尚不存在的目录。
+PROFILE_RUN_DIR="$profile_reports/profile-trace-$(date +%Y%m%d-%H%M%S)-$$" \
+  bash experiments/scripts/rtx4090/profile.sh trace --dry-run
+```
+
+`DMOE_RAY_TMPDIR` 指定 Ray 的父目录；启动器在其下创建独立的 `r-<随机字符>` 目录，存放 session、日志、默认 object spill 和原始 Nsight 报告。未设置时保持 `/tmp/streamep-ray-*`。父路径必须为绝对路径；启动前及 dry-run 都会按 10 位 PID 检查完整 socket 路径不超过 Linux 的 107 字节限制，因此应使用较短的路径。
+
+2026-11-09 在服务器 Nsight Systems 2025.6.1 上做的 2 秒 CPU 采集确认：该版本忽略 `NSYS_TMPDIR`，临时文件全部写入 `TMPDIR` 指定的位置。因此本部署使用 `DMOE_RUNTIME_TMPDIR`；`launch.sh` 在实际运行时把它设置为 `TMPDIR`，并传给 Python、Ray 和 Nsight。该变量必须为绝对路径，未设置时保留原来的运行时默认值。
+
+`DMOE_RUNTIME_TMPDIR` 只影响启动过程，不改变 `common.sh` 的构建配置或已有 `DMOE_TMPDIR`。C++ hostfile 仍使用编译进扩展的 `TEMP_DIR`，由原生代码创建该目录；运行时 `TMPDIR` 可以单独迁移，以上配置无需重编扩展。首次采集时仍应确认临时文件实际写入新目录，dry-run 不验证 Nsight 的落盘行为。
+
+`PROFILE_RUN_DIR` 控制指标、`run.log` 和最终收集的四份报告；`launch.sh` 还会在仓库的 `reports/rtx4090/` 写一份文本日志。报告收集采用复制，原始报告仍保留在 Ray session，容量预算还要包括 Nsight 临时数据及后续 SQLite 导出。若报错包含 `ray_spilled_objects`，先检查整个文件系统的占用；该路径只说明 Ray 的写入失败。迁移旧数据前确认对应进程已退出并核对目标副本，不要批量删除共享 `/tmp` 或仍被进程使用的目录。
+
 ## 3. 先采一对短实验
 
 ```bash
@@ -192,7 +218,7 @@ done
 
 采集使用 `capture-range=cudaProfilerApi`、`capture-range-end=stop-shutdown`、`kill=none`：结束采集 session 后让 Engine 继续完成指标与清理；`wait=primary` 要求 CLI 等待 actor 退出。四个 worker 通过 RPC 分别开关，边界有少量时间差。窗口包含请求到达间隔和尾部 drain，不能直接称为稳态。CLI 语义见 [Nsight 用户指南](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cli-profile-command-switch-options)。
 
-包装器在关闭自己的 Ray 前，最多等 60 秒收齐非空、连续两次检查大小/mtime 不变的报告，然后复制；原文件保留在打印的 `/tmp/streamep-ray-*/session_*/logs/nsight/`。稳定检查只能粗略判断落盘，不能替代解析。超时应保留该目录和 worker/runtime_env 日志，核对采集选项、工具错误与导出状态。现有 launcher 的 900 秒整程 timeout 包含初始化和导出，长实验可设置 `RUN_TIMEOUT_SECONDS`。
+包装器在关闭自己的 Ray 前，最多等 60 秒收齐非空、连续两次检查大小/mtime 不变的报告，然后复制；原文件保留在打印的 Ray 目录下 `session_*/logs/nsight/`，默认位置为 `/tmp/streamep-ray-*`，也可由 `DMOE_RAY_TMPDIR` 指定父目录。稳定检查只能粗略判断落盘，不能替代解析。超时应保留该目录和 worker/runtime_env 日志，核对采集选项、工具错误与导出状态。现有 launcher 的 900 秒整程 timeout 包含初始化和导出，长实验可设置 `RUN_TIMEOUT_SECONDS`。
 
 ## 5. 各项开销怎么看
 
@@ -222,3 +248,73 @@ done
 `TOPK_STATS age` 是 CPU 处理首个专家返回到处理第 K 个返回的间隔，含分支返回差异、通信和接收处理等，不能称为 gather kernel 开销。该统计跨 layer 汇总，不能直接当成每层等待分布。原 advanced logging 的 `queuing_delay` 来自 schedule 调用耗时除以 token 数，不能当作 token 入队到出队的等待。精确拆每 token 的 queue wait / Top-k join wait，需要带 token、layer、入队/到齐/出队时间的事件记录，并控制记录开销。
 
 原 `--profile-dir` 使用 PyTorch profiler，默认启动条件要求 batch 至少 100；四卡入口 attention cap 16 时可能没有期望的 attention 文件。旧 `--trace` 在当前 overlap/no-GDR 路径也不覆盖所有阶段，因此第一轮采用上述 Nsight 路线。
+
+## 6. 不采集 profile，扫描 expert cap
+
+`experiments/scripts/rtx4090/sweep_expert_cap.py` 串行调用现有 `profile_graph_b512.sh baseline`，默认比较 **128、256、512、1024**，每组一次。只需要同步脚本，不需要重新编译扩展。它依赖已经跑通的 RTX4090 launcher 和 B512 Graph 包装脚本。
+
+固定配置：全局请求 512、Attention cap 128、DP4/EP4/TP1、48 层、BF16、初始上下文 64、输出 128、defrag 调度、Attention/Expert CUDA Graph 均开启、`gpu-usage=0.80`。baseline 关闭 Nsight、PyTorch profiler 和 NVTX；每轮仍会正常初始化、捕获 Graph、预热，这些步骤不计入正式 benchmark 耗时。
+
+先停止自己此前启动的 SGLang 服务，确认四张卡可供本轮使用。在服务器仓库根目录运行：
+
+```bash
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda activate streamep4090
+export DMOE_RAY_TMPDIR=/workspace/zzc/ray
+export DMOE_RUNTIME_TMPDIR=/workspace/zzc/streamep4090/tmp
+
+# 可先验证全部参数；不访问 GPU，也不创建结果目录。
+python experiments/scripts/rtx4090/sweep_expert_cap.py --dry-run
+
+# 首轮快速比较：4 个 cap 各跑一次。输出目录必须是新目录。
+python experiments/scripts/rtx4090/sweep_expert_cap.py \
+  --output-dir "/workspace/zzc/streamep4090/reports/expert-cap-$(date +%Y%m%d-%H%M%S)-$$"
+```
+
+当前 runtime 没有固定权重与路由随机种子的入口。初步结果值得进一步确认时，用 `--repeats 3` 各跑三次；脚本会轮换每轮的 cap 顺序，保留逐次值，避免只凭某一次结果判断最优。也可以指定 `--caps 256 512` 只复测两组。设置 `RUN_TIMEOUT_SECONDS` 可以调整每轮的整程超时，默认 1800 秒，包含初始化和清理。
+
+控制台只显示 sweep 进度和每轮性能摘要，详细启动与执行输出写入日志。结果目录包含：
+
+- `sweep.json`：运行计划、命令、解释器和临时目录配置。
+- `runs.csv`：每轮的 cap、重复编号、状态、延迟、吞吐和日志路径。
+- `summary.csv`：每个 cap 各指标的跨次中位数，以及平均 ITL 的最小/最大值。
+- `cap-128-repeat-1/metrics.csv` 等：原始指标和统一起跑记录。
+- `cap-128-repeat-1.launcher.log` 等：完整启动及运行输出；子目录还有原有 `run.log`。
+
+优先比较 `itl_latency_mean_ms` 和 `itl_latency_p99_ms`，单位均为毫秒。`req_latency_*_ms` 是 **首 token 到末 token** 的时间；`e2e_duration` 是共同放行到 driver 收到全部结果的秒数。`summary.csv` 的 `median_itl_latency_p99_ms` 是多次实验各自 P99 的中位数，不是合并所有 token 后的 P99。`peak_itl_*=-1` 的未启用指标不纳入汇总。
+
+512 个 token、Top-8、EP4 在均匀路由下一层平均每卡有 1024 个 expert 分支，因此 128～1024 可以观察从细分批次到较大批次的变化。cap 只限制一次最多取多少，调大不会强制等待满批。Graph 桶和缓冲区也随 cap 增加，可能压缩可用 KV 空间；若 OOM、KV 容量不足、端口冲突或指标文件损坏，脚本保留已有结果和失败日志，停止后续实验，不会自动缩小请求数、调整显存比例或把失败记为零延迟。失败后先查看对应日志并确认本轮进程状态，再选择新目录重跑。
+
+本地验证覆盖真实 CLI 的四组 dry-run、汇总与失败处理；未在本地执行四卡 GPU 实验。
+
+## 7. SGLang 固定 64-token 输入，与 StreamEP 的初始上下文对齐
+
+将更新后的 `experiments/scripts/sglang/profile_client_dpa4_ep4_b512.py` 同步到服务器；无需重新安装环境或编译。新增的 `--input-tokens 64` 只改变客户端输入：512 个预热请求和 512 个测量请求都使用精确 64 个输入 token，包含聊天模板。输出仍为 128 token。不传该参数时继续使用原来的文本提示。
+
+客户端保留聊天模板前后缀、每个请求的编号以及预热/测量阶段标识，只在用户正文的 token 区域截断或用普通文本 token 补足。它直接发送 `input_ids`，避免服务端再次分词后长度变化。该模式用于固定输入长度的性能实验，裁剪/补齐后的输入内容与原来的自然文本提示有差别。没有改变前缀缓存、调度或通信配置。
+
+先结束自己的 StreamEP 实验并释放所用 GPU。在服务器的两个终端分别运行以下命令。这里显式开启 SGLang CUDA Graph，与 StreamEP Graph 实验对应。
+
+终端一：
+
+```bash
+cd /home/guest/guest0/projects/Qwen3/streamep4090
+SGLANG_DISABLE_CUDA_GRAPH=0 bash experiments/scripts/sglang/profile_server_dpa4_ep4_b512.sh
+```
+
+等服务就绪后，在终端二运行：
+
+```bash
+source /workspace/zzc/sglang-qwen30b/activate.sh
+cd /home/guest/guest0/projects/Qwen3/streamep4090
+SGLANG_DISABLE_CUDA_GRAPH=0 python experiments/scripts/sglang/profile_client_dpa4_ep4_b512.py \
+  --input-tokens 64
+```
+
+如需重复 Graph 关闭的实验，两端都改为 `SGLANG_DISABLE_CUDA_GRAPH=1`。服务端 `--context-length 2048` 保持原值，它是输入加生成长度的上限。
+
+客户端会检查每条预热和测量响应的 `meta_info.prompt_tokens == 64`、`completion_tokens == 128`；不符合时终止并报错。测量阶段出错也会尝试停止采集并保存响应。结果 JSON 文件名包含 `input64`，记录精确的请求 `input_ids`、`input_tokens`、`token_summary` 和 `warmup_token_summary`。`cached_tokens` 单独汇总；缓存命中不会缩短逻辑上下文长度。
+
+对齐的是 **初始 KV 长度 64**，两套系统的 KV 都随 decode 增长。SGLang 仍包含真实 prefill，其第一个输出 token 由 prefill 产生；StreamEP 使用 dummy KV 并执行合成 decode。因此这次改动没有把两者的整个请求执行路径变成同一个工作负载，也没有保证所有请求始终处于同一个 decode batch。分析时选取对应上下文长度的 decode 区间；客户端总耗时仍包含 prefill 和 HTTP。
+
+API 依据：[SGLang v0.5.9 的批量 input_ids 定义](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/managers/io_struct.py#L155-L159)及[直接使用已分词输入的逻辑](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/managers/tokenizer_manager.py#L614-L646)。本地验证使用模拟 tokenizer/HTTP 响应；实际 Qwen tokenizer 和四卡执行需在服务器运行时验证。

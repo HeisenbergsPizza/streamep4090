@@ -112,9 +112,36 @@ def check_ports(server):
         check_tcp_port(6699)
 
 
+def ray_temp_configuration():
+    """Validate Linux Ray socket paths before importing CUDA or starting Ray."""
+    configured_parent = os.environ.get("DMOE_RAY_TMPDIR")
+    parent = Path("/tmp" if configured_parent is None else configured_parent).expanduser()
+    if not parent.is_absolute():
+        raise ValueError("DMOE_RAY_TMPDIR must be a nonempty absolute directory path")
+    parent = Path(os.path.normpath(str(parent)))
+    prefix = "streamep-ray-" if configured_parent is None else "r-"
+    # CPython 3.12 mkdtemp adds 8 characters; Ray 2.43 adds this session/socket
+    # suffix. Reserve 10 PID digits and count UTF-8 bytes, as Ray does on Linux.
+    socket_path = (parent / (prefix + "xxxxxxxx")
+                   / "session_9999-12-31_23-59-59_999999_2147483647"
+                   / "sockets" / "plasma_store")
+    socket_bytes = len(str(socket_path).encode("utf-8"))
+    if socket_bytes > 107:
+        raise ValueError(
+            f"DMOE_RAY_TMPDIR would create a Ray socket path of {socket_bytes} bytes "
+            f"(Linux limit: 107); choose a shorter parent directory: {parent}"
+        )
+    return parent, prefix
+
+
 def main(argv=None):
     options, args, cli_args = parse_configuration(argv)
+    try:
+        ray_parent, ray_prefix = ray_temp_configuration()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(json.dumps({"mode": options.mode, "configuration": vars(args)}, indent=2), flush=True)
+    print(f"Ray temporary parent: {ray_parent}; per-run prefix: {ray_prefix}", flush=True)
     if options.dry_run:
         print("CLI validation passed; no GPU, Ray cluster, download, or file write was performed.")
         return
@@ -148,7 +175,8 @@ def main(argv=None):
     assert not ray.is_initialized(), "Launcher must own its Ray instance"
     # A user-provided RAY_ADDRESS must never redirect this single-node job.
     os.environ.pop("RAY_ADDRESS", None)
-    ray_dir = tempfile.mkdtemp(prefix="streamep-ray-", dir="/tmp")
+    ray_parent.mkdir(parents=True, exist_ok=True)
+    ray_dir = tempfile.mkdtemp(prefix=ray_prefix, dir=ray_parent)
     os.environ["RAY_TMPDIR"] = ray_dir
     print(f"Creating an independent local Ray cluster; logs: {ray_dir}", flush=True)
 
