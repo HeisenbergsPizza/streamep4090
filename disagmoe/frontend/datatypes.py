@@ -299,6 +299,7 @@ class TokenizedRequest:
     init_prefill_len: int
     max_output_len: int
     token_ids: List[int]
+    snapshot_index: Optional[int] = None
 
 @dataclass
 class BatchDecodeResult:

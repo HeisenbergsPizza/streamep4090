@@ -44,6 +44,7 @@ class DecodeSnapshot:
         self.head_dim = config["head_dim"]
         self.repeat = manifest["repeat"]
         self.rows = manifest["prompts"]
+        self._host_kv = None
         if type(self.repeat) is not int or self.repeat < 1:
             raise ValueError("Invalid snapshot repeat count")
         if not isinstance(self.rows, list) or not self.rows:
@@ -75,12 +76,22 @@ class DecodeSnapshot:
     def expected_tokens(self, i):
         return list(self.rows[self._row_index(i)]["expected_tokens"])
 
+    def stage_kv_on_host(self):
+        """Read each unique prompt's KV into owned CPU storage before timed arrivals."""
+        if self._host_kv is None:
+            # A safetensors tensor can be backed by a file mapping. Cloning reads
+            # the shared mount now and leaves ordinary host memory for admission.
+            self._host_kv = [self.load_kv(i).clone() for i in range(0, len(self), self.repeat)]
+        return sum(kv.numel() * kv.element_size() for kv in self._host_kv)
+
     def load_kv(self, i):
         """Load one request on CPU as [layer, K/V, position, KV head, head dim]."""
+        row = self._row_index(i)
+        if self._host_kv is not None:
+            return self._host_kv[row]
         import torch
         from safetensors import safe_open
 
-        row = self._row_index(i)
         path = self.root / kv_name(row)
         shape = (self.layers, 2, self.prompt_len(i), self.heads, self.head_dim)
         with safe_open(path, framework="pt", device="cpu") as f:

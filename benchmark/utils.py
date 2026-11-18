@@ -1,4 +1,15 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
+import math
+
+
+def arrival_window(value):
+    try:
+        start, end = map(float, value.split(","))
+        if math.isfinite(start) and math.isfinite(end) and 0 <= start < end:
+            return start, end
+    except ValueError:
+        pass
+    raise ArgumentTypeError("expected START_S,END_S with finite 0 <= START_S < END_S")
 
 def add_workload_arguments(parser: ArgumentParser):
     parser.add_argument("-n", "--num-requests", type=int, default=1000, help="number of requests to generate")
@@ -14,6 +25,11 @@ def add_workload_arguments(parser: ArgumentParser):
     parser.add_argument("--dataset-max-context-len", type=int, default=None, help="max total context length (input+output) to filter dataset samples. Used with --generator-type=dataset")
     parser.add_argument("--checkpoint-path", help="Local Qwen3-30B-A3B BF16 safetensors directory for real decode")
     parser.add_argument("--decode-snapshot", help="Prefilled KV and greedy reference from prepare_qwen_decode.py")
+    parser.add_argument("--paced-decode", action="store_true",
+                        help="admit real snapshot requests at fixed intervals of 1/--rate seconds")
+    parser.add_argument("--arrival-window", type=arrival_window, metavar="START_S,END_S",
+                        help="measurement window for --paced-decode, in seconds since first arrival "
+                             "(default: the full offered-load interval [0, num_requests/rate))")
     parser.add_argument("--gate-profile-file", type=str, default=None, help="path to gate profile file to upload and broadcast to workers")
     
 def add_runtime_arguments(parser: ArgumentParser):

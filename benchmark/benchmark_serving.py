@@ -87,12 +87,18 @@ class BenchmarkMetrics:
                 "num_experts": args.num_experts,
                 **metrics
             }
+            # An existing CSV can also contain offline runs without window columns.
+            for column in new_row:
+                if column not in df.columns:
+                    df[column] = np.nan
             df.loc[len(df)] = new_row
             if filename.endswith(".csv"):
                 df.to_csv(filename, index=False)
             else:
                 df.to_excel(filename, index=False)
         except Exception as e:
+            if getattr(args, "paced_decode", False):
+                raise
             print("Error: failed to write to file, with exception:", e)
 
 def override_model_config_with_args(args, model_config: ModelConfig):
@@ -202,6 +208,7 @@ def launch(args):
         from disagmoe.utils.decode_snapshot import DecodeSnapshot
         model_config.checkpoint_path = os.path.abspath(os.path.expanduser(args.checkpoint_path))
         model_config.decode_snapshot = os.path.abspath(os.path.expanduser(args.decode_snapshot))
+        model_config.paced_decode = getattr(args, "paced_decode", False)
         snapshot = DecodeSnapshot(model_config.decode_snapshot, model_config.checkpoint_path)
         if len(snapshot) != args.num_requests:
             raise ValueError(f"Snapshot has {len(snapshot)} requests, benchmark requests {args.num_requests}")
@@ -589,13 +596,16 @@ async def benchmark_warmup(master: Controller, args):
     master.reset()
     logger.info("Warmup done.")
 
-def post_benchmark(master, args, results, req_submit_timestamps, req_finish_timestamps, duration):
+def post_benchmark(master, args, results, req_submit_timestamps, req_finish_timestamps, duration,
+                   paced_report=None):
     if getattr(args, "checkpoint_path", None):
         from disagmoe.utils.decode_snapshot import DecodeSnapshot, compare_decode_results
-        report = master.synchronized_start_report
-        snapshot = DecodeSnapshot(report["decode_snapshot"], report["checkpoint_path"])
-        validation = compare_decode_results(snapshot, report["snapshot_index_by_request"],
-                                            results, args.min_output_len)
+        if paced_report is not None:
+            indices = {r["req_id"]: r["snapshot_index"] for r in paced_report["requests"]}
+        else:
+            indices = master.synchronized_start_report["snapshot_index_by_request"]
+        snapshot = DecodeSnapshot(args.decode_snapshot, args.checkpoint_path)
+        validation = compare_decode_results(snapshot, indices, results, args.min_output_len)
         output = os.fspath(args.file) + ".decode.json"
         with open(output, "w", encoding="utf-8") as handle:
             json.dump(validation, handle, indent=2)
@@ -604,6 +614,27 @@ def post_benchmark(master, args, results, req_submit_timestamps, req_finish_time
                              f"{validation['mismatched_requests']} requests. Compare tokens in {output}")
         logger.info(f"Greedy reference prefix matched on all {len(results)} requests: {output}")
     metrics = analyze_results(results, duration)
+    if paced_report is not None:
+        paced_report["configuration"] = vars(args).copy()
+        window = paced_report["window"]
+        rows = paced_report["requests"]
+        latencies = [(r["response_s"] - r["scheduled_s"]) * 1000 for r in rows]
+        metrics.req_latency_mean_ms = float(np.mean(latencies))
+        metrics.req_latency_median_ms = float(np.median(latencies))
+        metrics.req_latency_p99_ms = float(np.percentile(latencies, 99))
+        # Follow arrivals in the window through completion, including the drain.
+        window_latencies = [ms for r, ms in zip(rows, latencies)
+                            if window["start_s"] <= r["scheduled_s"] < window["end_s"]]
+        window["req_latency_median_ms"] = float(np.median(window_latencies)) if window_latencies else -1
+        window["req_latency_p99_ms"] = float(np.percentile(window_latencies, 99)) if window_latencies else -1
+        for key, value in window.items():
+            setattr(metrics, "window_" + key, value)
+        filename = os.fspath(args.file) + ".paced.json"
+        with open(filename, "w", encoding="utf-8") as handle:
+            json.dump(paced_report, handle)
+        logger.info(f"Paced window [{window['start_s']:.2f}, {window['end_s']:.2f}) s: "
+                    f"{window['req_throughput']:.3f} req/s, {window['token_throughput']:.1f} output tok/s; "
+                    f"outstanding {window['outstanding_start']} -> {window['outstanding_end']}; {filename}")
     
     if args.trace:
         step_stats = master.fetch_step_stats()
@@ -646,16 +677,23 @@ async def benchmark_serving(
 ):
     assert master is not None, "master is not initialized"
     synchronized_start = getattr(args, "synchronized_start", False)
-    if synchronized_start:
+    paced = getattr(args, "paced_decode", False)
+    if synchronized_start or paced:
         from disagmoe.utils.synchronized_start import validate_configuration
         validate_configuration(args)
         if is_api_server:
-            raise ValueError("Synchronized start requires a dedicated benchmark launch")
+            raise ValueError("This workload requires a dedicated benchmark launch")
     
     if not is_api_server:
         master.start_polling_results()
-        await master.start_scheduler()
-        if getattr(args, "checkpoint_path", None):
+        scheduler_options = {"paced_real_decode": True} if paced else {}
+        await master.start_scheduler(**scheduler_options)
+        if paced:
+            # Warm the dynamic admission path without reserving the entire workload.
+            warmup = [master.put_snapshot_request(i, args.min_input_len, min(2, args.min_output_len))
+                      for i in range(min(args.num_requests, args.dp_size))]
+            await asyncio.gather(*(response.get() for response in warmup))
+        elif getattr(args, "checkpoint_path", None):
             warmup_steps = min(2, args.min_output_len)
             logger.info(f"Warming up real decode with {warmup_steps} step(s) per request")
             try:
@@ -677,6 +715,7 @@ async def benchmark_serving(
     # Every GPU actor starts capture after warmup. No per-layer synchronization
     # is introduced; capture ends after all benchmark responses have arrived.
     nsys_enabled = getattr(args, "nsys", False)
+    paced_report = None
     try:
         if synchronized_start:
             responses = await master.prepare_synchronized_start(
@@ -686,6 +725,12 @@ async def benchmark_serving(
         if synchronized_start:
             results, req_submit_timestamps, req_finish_timestamps, duration = await run_synchronized_benchmark(
                 master, args, responses)
+        elif paced:
+            from paced_decode import run_paced_requests
+            results, paced_report = await run_paced_requests(master, args)
+            duration = paced_report["duration_s"]
+            req_submit_timestamps = [r["submitted_s"] for r in paced_report["requests"]]
+            req_finish_timestamps = [r["response_s"] for r in paced_report["requests"]]
         else:
             results, req_submit_timestamps, req_finish_timestamps, duration = await run_benchmark(
                 master, args, args.generator_type, args.num_requests,
@@ -716,7 +761,8 @@ async def benchmark_serving(
         
     master.stop_profile()
     
-    metrics = post_benchmark(master, args, results, req_submit_timestamps, req_finish_timestamps, duration)
+    metrics = post_benchmark(master, args, results, req_submit_timestamps, req_finish_timestamps, duration,
+                             paced_report=paced_report)
     
     master.reset()
     

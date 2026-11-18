@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 class AsyncResult:
     def __init__(self, req_id: int):
         self.req_id = req_id
+        self.admitted_at = None  # perf_counter seconds when paced decode reserves a DP rank.
         self._finished = asyncio.Event()
         self.slo_stat = None
         self._error = None

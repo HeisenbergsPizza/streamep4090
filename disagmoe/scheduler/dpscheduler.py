@@ -23,6 +23,7 @@ class DPScheduler:
         self.block_size = block_size
         self.seq_ranks = {}
         self.seq_max_len = {}
+        self.free_request_slots = None
         
         self._logger = new_logger("DPScheduler")
         self._loop_task: asyncio.Task = None
@@ -35,9 +36,10 @@ class DPScheduler:
         self.sch_event = asyncio.Event()
         self.waiting_queue = asyncio.Queue()
         
-    def start(self, stats: Dict[int, int]):
+    def start(self, stats: Dict[int, int], *, request_slots=None):
         self._logger.info(f"Start with stats {stats}")
         self.init_kv_cache_stats(stats)
+        self.free_request_slots = dict(request_slots) if request_slots is not None else None
         self.reset()
         
         self._loop_task = asyncio.create_task(self.waiting_loop())
@@ -110,6 +112,8 @@ class DPScheduler:
         print(f"Init cache stats {self.kv_cache_stats}")
     
     def add_seq(self, seq_id: int, prefill_len: int, output_len: int, rank: int):
+        if self.free_request_slots is not None:
+            self.free_request_slots[rank] -= 1
         self.seq_max_len[seq_id] = (prefill_len, output_len)
         required_blocks = self.required_blocks(prefill_len, output_len)
         self.kv_cache_stats[rank] -= required_blocks
@@ -117,6 +121,8 @@ class DPScheduler:
         
     def del_seq(self, seq_id: int):
         rank = self.seq_ranks[seq_id]
+        if self.free_request_slots is not None:
+            self.free_request_slots[rank] += 1
         self.seq_ranks.pop(seq_id)
         prefill_len, output_len = self.seq_max_len[seq_id]
         self.kv_cache_stats[rank] += self.required_blocks(prefill_len, output_len)
@@ -126,6 +132,11 @@ class DPScheduler:
         
     def _schedule(self, prefill_len: int, output_len: int) -> int:
         raise NotImplementedError()
+
+    def available_blocks(self, rank: int) -> int:
+        if self.free_request_slots is not None and self.free_request_slots[rank] == 0:
+            return 0
+        return self.kv_cache_stats[rank]
     
     def schedule(self, req_ids: List[int], prefill_lens: List[int], output_lens: List[int]) -> List[int]:
         ranks = []
@@ -142,7 +153,8 @@ class DPSchedulerMax(DPScheduler):
     def _schedule(self, prefill_len: int, output_len: int) -> int:
         stat = 0
         rank = -1
-        for i, num_blocks in enumerate(self.kv_cache_stats):
+        for i in range(self.dp_size):
+            num_blocks = self.available_blocks(i)
             if num_blocks > stat:
                 stat = num_blocks
                 rank = i
@@ -178,7 +190,7 @@ class DPSchedulerCapRR(DPScheduler):
         for _ in range(self.dp_size):
             rank = self.cur_rank
             self.cur_rank = (self.cur_rank + 1) % self.dp_size
-            if self.kv_cache_stats[rank] >= required:
+            if self.available_blocks(rank) >= required:
                 return rank
         return -1
 
@@ -196,7 +208,8 @@ class DPSchedulerWeighted(DPScheduler):
         required = self.required_blocks(prefill_len, output_len)
         best_rank = -1
         best_score = -1.0
-        for i, num_blocks in enumerate(self.kv_cache_stats):
+        for i in range(self.dp_size):
+            num_blocks = self.available_blocks(i)
             if num_blocks < required:
                 continue
             score = num_blocks * self.weights[i]

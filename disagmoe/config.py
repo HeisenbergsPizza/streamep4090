@@ -36,6 +36,7 @@ class ModelConfig:
     shared_expert_intermediate_size: Optional[int] = None
     checkpoint_path: Optional[str] = None
     decode_snapshot: Optional[str] = None
+    paced_decode: bool = False
     
     @property
     def num_experts_per_rank(self):

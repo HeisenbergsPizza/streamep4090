@@ -5,6 +5,7 @@ import torch
 import os
 import asyncio
 import time
+from functools import partial
 
 PlacementGroupSchedulingStrategy = importlib.import_module(
     "ray.util.scheduling_strategies"
@@ -59,6 +60,8 @@ class Controller:
         self.is_polling = False
         self._poll_error = None
         self._max_cache_blocks = None
+        self._paced_snapshot_size = None
+        self._snapshot_sends = set()
         self._synchronized_start_gate = None
         self._synchronized_start_responses = []
         self.synchronized_start_report = None
@@ -80,7 +83,10 @@ class Controller:
         tokenizer_ports = [TOKENIZER_PORT_BASE + i for i in range(self.model_config.dp_size)]
         self.tokenizer_addrs = ray.get(self.tokenizer.init_tokenizer_sockets.remote(tokenizer_ports, self.host_ifname))
         
-        self.detokenizer = Detokenizer.remote(collect_token_ids=bool(self.model_config.checkpoint_path))
+        self.detokenizer = Detokenizer.remote(
+            collect_token_ids=bool(self.model_config.checkpoint_path),
+            paced_clock=getattr(self.model_config, "paced_decode", False),
+        )
         detokenizer_port = DETOKENIZER_PORT_BASE
         self.detokenizer_addr = ray.get(self.detokenizer.init_detokenizer_socket.remote(detokenizer_port, self.host_ifname))
             
@@ -401,11 +407,14 @@ class Controller:
         except asyncio.CancelledError:
             return
         except Exception as error:
-            self._poll_error = error
-            self.is_polling = False
-            get_logger().error(f"Result polling failed: {error}")
-            for result in list(self.request_results.values()):
-                await result.fail(error)
+            await self._fail_pending_requests(error)
+
+    async def _fail_pending_requests(self, error):
+        self._poll_error = error
+        self.is_polling = False
+        get_logger().error(f"Request processing failed: {error}")
+        for result in list(self.request_results.values()):
+            await result.fail(error)
     
     def start_polling_results(self):
         self.is_polling = True
@@ -422,6 +431,36 @@ class Controller:
             self._polling_task = None
             
     def put_single_request(self, input_len: int, output_len: int) -> AsyncResult:
+        return self._enqueue_request(input_len, output_len, self.tokenizer.put_single_request.remote)
+
+    def put_snapshot_request(self, snapshot_index: int, input_len: int, output_len: int) -> AsyncResult:
+        """Queue an already-prefilled request even if all DP ranks are busy."""
+        if self._paced_snapshot_size is None:
+            raise RuntimeError("Start the paced decode scheduler before submitting snapshots")
+        if type(snapshot_index) is not int or not 0 <= snapshot_index < self._paced_snapshot_size:
+            raise ValueError(f"Snapshot index {snapshot_index} is outside the prepared workload")
+        dispatch = partial(self._dispatch_snapshot, snapshot_index=snapshot_index)
+        return self._enqueue_request(input_len, output_len, dispatch)
+
+    def _dispatch_snapshot(self, req_id, input_len, output_len, rank, *, snapshot_index):
+        if self._poll_error is not None:
+            return
+        self.request_results[req_id].admitted_at = time.perf_counter()
+
+        async def send():
+            try:
+                await self.tokenizer.put_single_request.remote(
+                    req_id, input_len, output_len, rank, snapshot_index=snapshot_index)
+            except Exception as error:
+                # Delivery may already have reached the worker. Stop this run
+                # instead of reusing its KV reservation or sending the ID twice.
+                await self._fail_pending_requests(error)
+
+        task = asyncio.create_task(send())
+        self._snapshot_sends.add(task)
+        task.add_done_callback(self._snapshot_sends.discard)
+
+    def _enqueue_request(self, input_len, output_len, dispatch) -> AsyncResult:
         if self._poll_error is not None:
             raise RuntimeError("Inference service has failed") from self._poll_error
         validate_request_lengths(
@@ -433,10 +472,7 @@ class Controller:
         req_id = self.get_new_req_id()
         res = AsyncResult(req_id)
         self.request_results[req_id] = res
-        dp_scheduler.put_request(
-            self.tokenizer.put_single_request.remote,
-            req_id, input_len + output_len, input_len, output_len
-        )
+        dp_scheduler.put_request(dispatch, req_id, input_len + output_len, input_len, output_len)
         return res
     
     async def prepare_synchronized_start(self, num_requests, input_len, output_len, timeout_s=120.0):
@@ -666,19 +702,41 @@ class Controller:
         tasks = [worker.stop_profile.remote() for worker in self.workers]
         ray.get(tasks)
         
-    async def start_scheduler(self):
+    async def start_scheduler(self, *, paced_real_decode=False):
         assert self.dp_scheduler is not None
-        stats = {self.model_place.attn_dp_rank_at(device_id): 1 << 31 for device_id in self.device_ids if self.model_place.has_attn(device_id)}
-        for worker, device_id in zip(self.workers, self.device_ids):
-            if self.model_place.has_attn(device_id):
-                rank = self.model_place.attn_dp_rank_at(device_id)
-                stats[rank] = min(stats[rank], ray.get(worker.get_configured_kv_cache_blocks.remote()))
+        workers = [(self.model_place.attn_dp_rank_at(device_id), worker)
+                   for worker, device_id in zip(self.workers, self.device_ids)
+                   if self.model_place.has_attn(device_id)]
+        capacities = await asyncio.gather(*[
+            worker.get_configured_kv_cache_blocks.remote() for _, worker in workers])
+        stats = {}
+        for (rank, _), blocks in zip(workers, capacities):
+            stats[rank] = min(blocks, stats.get(rank, blocks))
+        if paced_real_decode:
+            # Load snapshots in CPU memory before timing. Only admitted requests
+            # occupy GPU KV pages and worker residual rows.
+            staged = await asyncio.gather(*[
+                worker.prepare_paced_snapshot.remote() for _, worker in workers])
+            sizes = {item["requests"] for item in staged}
+            if len(sizes) != 1:
+                raise RuntimeError("Paced workers disagree on the snapshot size")
+            self._paced_snapshot_size = sizes.pop()
+            slots = {rank: item["request_slots"] for (rank, _), item in zip(workers, staged)}
+            # The native block manager requires a spare block on append.
+            stats = {rank: max(0, capacity - 1) for rank, capacity in stats.items()}
+            self.dp_scheduler.start(stats, request_slots=slots)
+        else:
+            self.dp_scheduler.start(stats)
         self._max_cache_blocks = max(stats.values())
-        self.dp_scheduler.start(stats)
     
     async def stop_scheduler(self):
         assert self.dp_scheduler is not None
         await self.dp_scheduler.terminate()
+        sends = list(self._snapshot_sends)
+        for task in sends:
+            task.cancel()
+        if sends:
+            await asyncio.gather(*sends, return_exceptions=True)
 
     def reset(self):
         self.in_flight_reqs.clear()

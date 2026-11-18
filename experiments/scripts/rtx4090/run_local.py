@@ -63,12 +63,17 @@ def parse_configuration(argv=None):
                 raise ValueError("Export at least one greedy reference step per prompt")
         except (ValueError, OSError, KeyError, TypeError) as exc:
             wrapper.error(f"Invalid real-decode workload: {exc}")
+        if args.paced_decode:
+            defaults += ["--generator-type", "uniform"]
+            attn_cap = 128
+        else:
+            defaults += ["--synchronized-start", "--generator-type", "offline"]
+            attn_cap = max(16, len(snapshot) // 4)
         defaults += [
-            "--synchronized-start", "--generator-type", "offline",
             "--num-requests", str(len(snapshot)),
             "--min-input-len", str(length), "--max-input-len", str(length + 1),
             "--min-output-len", str(steps), "--max-output-len", str(steps + 1),
-            "--max-batch-size-attn", str(max(16, len(snapshot) // 4)),
+            "--max-batch-size-attn", str(attn_cap),
             "--max-batch-size-expert", "512", "--unified-scheduler-type", "defrag",
         ]
         cli_args = defaults + extra + ["--checkpoint-path", checkpoint_path, "--decode-snapshot", snapshot_path]
@@ -100,7 +105,8 @@ def parse_configuration(argv=None):
         wrapper.error("Use either --nsys or --profile-dir, not both CUPTI collectors")
     if args.nsys and options.mode == "server":
         wrapper.error("Nsight capture supports one smoke/benchmark run per launch; use benchmark mode")
-    if args.synchronized_start or args.checkpoint_path or args.decode_snapshot:
+    if (args.synchronized_start or args.checkpoint_path or args.decode_snapshot
+            or args.paced_decode or args.arrival_window is not None):
         if options.mode == "server":
             wrapper.error("--synchronized-start supports one smoke/benchmark cohort; use benchmark mode")
         # Keep dry-run independent of the GPU/runtime package imports.
@@ -261,6 +267,9 @@ def main(argv=None):
                         "report_file": str(Path(str(args.file) + ".synchronized-start.json").resolve()),
                         "report": getattr(master, "synchronized_start_report", None),
                     }
+                elif args.paced_decode:
+                    manifest["workload"] = "Qwen3-30B-A3B greedy decode from snapshot KV at a fixed arrival rate"
+                    manifest["capture_window"] = "after model warmup and host KV staging through the last response"
                 (profile_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
                 print(f"PROFILE: copied {len(reports)} reports to {profile_dir}; inspect with nsys stats/GUI.", flush=True)
     finally:

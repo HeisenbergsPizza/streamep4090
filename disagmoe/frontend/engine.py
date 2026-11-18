@@ -171,6 +171,14 @@ class AttentionEngineMixin:
             return None
         
         attn_meta = self._attn_driver_preprocess(schedule_batch.meta_c, schedule_batch)
+        if (schedule_batch.layer_id == 0 and self._pending_snapshot_indices
+                and schedule_batch.num_prefill_seqs):
+            # Native attention merging places newly registered rows first. Only
+            # those rows need restored KV; continuing rows already have live KV.
+            count = schedule_batch.num_prefill_seqs
+            indices = [self._pending_snapshot_indices.pop(rid)
+                       for rid in schedule_batch.req_ids[:count]]
+            self._restore_snapshot_rows(self._paced_snapshot, indices, attn_meta.block_tables[:count])
         positions = schedule_batch.seq_lens_tensor.to(torch.int64)
         if self.model_config.checkpoint_path:
             # seq_lens includes the KV slot being written by the current token.
@@ -264,6 +272,8 @@ class AttentionEngineMixin:
         continue_meta.attn_dp_ranks = [self.attn_dp_rank] * len(continue_ids)
         continue_meta.layer_id = 0
         self.release_seqs(finish_req_ids)
+        if next_ids is not None:
+            self.decode_residuals.release(finish_req_ids)
         
         batch_res = BatchDecodeResult(
             req_ids=batch.req_ids,
@@ -558,6 +568,9 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         self._synchronized_start_cancelled = Event()
         self._synchronized_start_labels = False
         self._real_cohort_reset = None
+        self.decode_residuals = None
+        self._paced_snapshot = None
+        self._pending_snapshot_indices = {}
         self.local_to_gloabl_expert_rank = []
         self.global_to_local_expert_rank = []
         self.device_group_ids = []
@@ -826,28 +839,48 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         else:
             command.set_result(None)
 
-    def _prepare_snapshot_decode(self, requests, batch):
+    def prepare_paced_snapshot(self):
+        """Stage immutable prompt KV in this rank's CPU memory before admission."""
+        from disagmoe.utils.decode_snapshot import DecodeSnapshot
+
+        cfg = self.model_config
+        if not self.has_attn or not cfg.checkpoint_path or not cfg.decode_snapshot:
+            raise ValueError("Paced snapshot decode requires an attention owner with a real checkpoint")
+        snapshot = self._paced_snapshot
+        if snapshot is None:
+            snapshot = DecodeSnapshot(cfg.decode_snapshot, cfg.checkpoint_path)
+        host_bytes = snapshot.stage_kv_on_host()
+        self._paced_snapshot = snapshot
+        return dict(requests=len(snapshot), unique_prompts=len(snapshot.rows), host_kv_bytes=host_bytes,
+                    request_slots=min(len(snapshot), self.cache_config.num_gpu_blocks))
+
+    def _restore_snapshot_rows(self, snapshot, indices, block_tables):
         from disagmoe.frontend.real_decode import restore_prompt_kv
+
+        blocks = block_tables.cpu().tolist()
+        if len(blocks) != len(indices):
+            raise ValueError("Initial KV block table must have one row per new request")
+        buffers = [self.attn_executor.kv_cache.get_kv_buffer(i)
+                   for i in range(self.model_config.num_layers)]
+        for index, pages in zip(indices, blocks):
+            restore_prompt_kv(snapshot.load_kv(index), buffers, pages)
+
+    def _prepare_snapshot_decode(self, requests, batch):
         from disagmoe.utils.decode_snapshot import DecodeSnapshot
 
         cfg = self.model_config
         snapshot = DecodeSnapshot(cfg.decode_snapshot, cfg.checkpoint_path)
         by_id = {r["req_id"]: r for r in requests}
         # Use the scheduler's actual row order for the block table and first token.
-        blocks = batch.metadata.block_tables.cpu().tolist()
-        layer_buffers = [self.attn_executor.kv_cache.get_kv_buffer(i)
-                         for i in range(cfg.num_layers)]
-        if len(blocks) != len(batch.req_ids):
-            raise ValueError("Initial KV block table must have one row per request")
-        first_tokens = []
-        for rid, pages in zip(batch.req_ids, blocks):
+        indices = []
+        for rid in batch.req_ids:
             request = by_id[rid]
             index = request["snapshot_index"]
             if snapshot.prompt_len(index) != request["input_len"]:
                 raise ValueError(f"Snapshot prompt length differs from KV reservation for request {rid}")
-            restore_prompt_kv(snapshot.load_kv(index), layer_buffers, pages)
-            first_tokens.append(snapshot.first_token(index))
-        return torch.tensor(first_tokens, dtype=torch.long, device=self.device)
+            indices.append(index)
+        self._restore_snapshot_rows(snapshot, indices, batch.metadata.block_tables)
+        return torch.tensor([snapshot.first_token(i) for i in indices], dtype=torch.long, device=self.device)
 
     def _execute_synchronized_start(self):
         """Prepare once on the CUDA-owning thread, then wait for the common CPU gate."""
@@ -1118,13 +1151,30 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         else:
             assert False, "Invalid batch metadata"
             
+    def _paced_request_input(self, request):
+        from disagmoe.frontend.real_decode import DecodeResiduals
+
+        snapshot = self._paced_snapshot
+        index = request.snapshot_index
+        if snapshot is None or index is None:
+            raise ValueError("Real arrivals need staged snapshot KV and a snapshot index")
+        if snapshot.prompt_len(index) != request.init_prefill_len:
+            raise ValueError(f"Snapshot prompt length differs from admission for request {request.req_id}")
+        if self.decode_residuals is None:
+            # Every admitted request reserves at least one KV page on this rank.
+            capacity = min(len(snapshot), self.cache_config.num_gpu_blocks)
+            self.decode_residuals = DecodeResiduals(
+                [], self.model_config.hidden_size, self.device, capacity=capacity)
+        self.decode_residuals.admit(request.req_id)
+        self._pending_snapshot_indices[request.req_id] = index
+        first_id = torch.tensor([snapshot.first_token(index)], dtype=torch.long, device=self.device)
+        return self.attn_executor.embed_tokens(first_id)
+
     def recv_new_request(self):
         if self.tokenizer_socket is None:
             return
         try:
             new_request: TokenizedRequest = self.tokenizer_socket.recv_pyobj(zmq.NOBLOCK)
-            if self.model_config.checkpoint_path:
-                raise ValueError("Real decode requests require an offline snapshot and synchronized start")
             meta = BatchMetadata(
                 shape=[1, self.model_config.hidden_size],
                 dtype="bfloat16",
@@ -1137,7 +1187,10 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             )
             self.record_max_output_lens(new_request.req_id, new_request.max_output_len)
             batch: TokenBatch = TokenBatch_C()
-            batch.data = torch.rand((1, self.model_config.hidden_size), dtype=torch.bfloat16, device=self.device)
+            if self.model_config.checkpoint_path:
+                batch.data = self._paced_request_input(new_request)
+            else:
+                batch.data = torch.rand((1, self.model_config.hidden_size), dtype=torch.bfloat16, device=self.device)
             batch.metadata = meta.to_c()
             self.pool.put_batch(batch)
             self._advanced_logger.log_pool_put(1)

@@ -5,14 +5,18 @@ are not imported. The shared start gate and DP reservation methods stay real.
 """
 import ast
 import asyncio
+import importlib.util
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 import sys
 import threading
 import time
 from types import SimpleNamespace
+from typing import Optional
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+import typing
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -249,6 +253,66 @@ class EngineSynchronizedStartTest(unittest.TestCase):
         self.assertEqual(self.engine.get_synchronized_start_status()["state"], "failed")
 
 
+@unittest.skipUnless(importlib.util.find_spec("torch"), "CPU tensor test requires torch")
+class PacedWorkerTest(unittest.TestCase):
+    def test_mixed_first_layer_batch_restores_new_kv_in_scheduled_order(self):
+        import torch
+        from disagmoe.frontend.real_decode import DecodeResiduals
+
+        class Snapshot:
+            def __len__(self):
+                return 4
+
+            def prompt_len(self, i):
+                return 2
+
+            def first_token(self, i):
+                return 10 + i
+
+            def load_kv(self, i):
+                return torch.full((1, 2, 2, 1, 1), i + 1, dtype=torch.bfloat16)
+
+        ns = {"torch": torch, "TokenBatchCWrapper": object, "AttentionForwardBatch": SimpleNamespace,
+              "Optional": Optional, "use_gdrcopy_optimization": False,
+              "AttentionScheduleBatch": SimpleNamespace(build=lambda meta, data: meta)}
+        worker = _source_class("disagmoe/frontend/engine.py", "Engine",
+                               ("_paced_request_input", "_restore_snapshot_rows"), ns)()
+        mixin = _source_class("disagmoe/frontend/engine.py", "AttentionEngineMixin",
+                              ("preprocess_batch_attn",), ns)
+        worker.model_config = SimpleNamespace(checkpoint_path="/model", num_layers=1, hidden_size=1)
+        worker.model_total_num_layers = 1
+        worker.cache_config = SimpleNamespace(num_gpu_blocks=6)
+        worker._paced_snapshot = Snapshot()
+        worker._pending_snapshot_indices = {}
+        worker.device = "cpu"
+        worker.decode_residuals = DecodeResiduals([7], 1, "cpu", capacity=3)
+        pages = torch.full((2, 6, 2, 1, 1), -1., dtype=torch.bfloat16)
+        worker.attn_executor = SimpleNamespace(embed_tokens=lambda ids: ids[:, None],
+                                               kv_cache=SimpleNamespace(get_kv_buffer=lambda layer: pages))
+        worker.execute_batch_attn = worker.postprocess_batch_attn = lambda batch: None
+        for rid, index in [(20, 0), (30, 3)]:
+            req = SimpleNamespace(req_id=rid, snapshot_index=index, init_prefill_len=2)
+            self.assertEqual(worker._paced_request_input(req).item(), 10 + index)
+
+        # The continuing request has live KV on page 0. New admissions are
+        # scheduled in reverse arrival order and own pages 2 and 3.
+        meta = SimpleNamespace(req_ids=[30, 20, 7], num_prefill_seqs=2, layer_id=0,
+                               meta_c=None, data=torch.tensor([[13], [10], [90]]),
+                               num_tokens=lambda: 3, seq_lens_tensor=torch.tensor([3, 3, 4]))
+        worker._attn_driver_preprocess = lambda *_: SimpleNamespace(
+            block_tables=torch.tensor([[2, 4], [3, 5], [0, 1]]))
+        forward = mixin.preprocess_batch_attn(worker, SimpleNamespace(metadata=meta, data=meta.data))
+        self.assertEqual(forward.positions.tolist(), [2, 2, 3])
+        self.assertTrue((pages[:, 2] == 4).all())
+        self.assertTrue((pages[:, 3] == 1).all())
+        self.assertTrue((pages[:, :2] == -1).all())
+        self.assertEqual(worker._pending_snapshot_indices, {})
+        freed = worker.decode_residuals.rows[30]
+        worker.decode_residuals.release([30])
+        worker.decode_residuals.admit(40)
+        self.assertEqual(worker.decode_residuals.rows[40], freed)
+
+
 class _RemoteMethod:
     def __init__(self, function):
         self.function = function
@@ -313,6 +377,8 @@ class RealTokenFeedbackTest(unittest.TestCase):
         engine.dummy_sampler.create_request(19, 2)
         engine.attn_dp_rank = 0
         engine.model_config = SimpleNamespace(checkpoint_path="/model")
+        from disagmoe.frontend.real_decode import DecodeResiduals
+        engine.decode_residuals = DecodeResiduals([71, 19], 3, "cpu")
         reported, freed = [], []
         engine.detokenizer_socket = SimpleNamespace(send_pyobj=reported.append)
         engine.release_seqs = freed.extend
@@ -333,6 +399,7 @@ class RealTokenFeedbackTest(unittest.TestCase):
         self.assertEqual((reported[1].token_ids, reported[1].is_eos), ([2], [True]))
         self.assertEqual(last.data.shape[0], 0)
         self.assertEqual(freed, [71, 19])
+        self.assertEqual(engine.decode_residuals.rows, {})
 
 
 class _Worker:
@@ -400,6 +467,7 @@ class ControllerSynchronizedStartTest(unittest.IsolatedAsyncioTestCase):
         scheduler.waiting_queue = asyncio.Queue()
         scheduler.block_size = 16
         scheduler.kv_cache_stats = [128] * 4
+        scheduler.free_request_slots = None
         scheduler.seq_ranks = {}
         scheduler.seq_max_len = {}
         scheduler.sch_event = asyncio.Event()
@@ -503,6 +571,78 @@ class ControllerSynchronizedStartTest(unittest.IsolatedAsyncioTestCase):
             await self.controller.release_synchronized_start()
         directory = Path(self.controller._synchronized_start_gate["directory"])
         self.assertFalse((directory / "release.json").exists())
+
+
+@unittest.skipIf(sys.version_info < (3, 10), "scheduler annotations require Python >=3.10")
+class ControllerPacedAdmissionTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        with patch.object(typing, "override", getattr(typing, "override", lambda f: f), create=True):
+            from disagmoe.scheduler.dpscheduler import DPSchedulerMax
+        cls = _source_class("disagmoe/frontend/controller.py", "Controller", (
+            "start_scheduler", "stop_scheduler", "get_new_req_id", "put_snapshot_request",
+            "_dispatch_snapshot", "_enqueue_request", "process_finished_results",
+            "_fail_pending_requests",
+        ), dict(asyncio=asyncio, time=time, AsyncResult=AsyncResult, partial=partial,
+                validate_request_lengths=validate_request_lengths, List=typing.List,
+                SloStat=SimpleNamespace, ray=SimpleNamespace(get=lambda result: result),
+                get_logger=lambda: SimpleNamespace(error=lambda _: None)))
+        master = self.master = cls()
+        master.model_config = SimpleNamespace(max_seq_len=4096)
+        master.cache_config = SimpleNamespace(block_size=16)
+        master.dp_scheduler = DPSchedulerMax(1, 16)
+        master.device_ids = [0]
+        master.model_place = SimpleNamespace(has_attn=lambda _: True, attn_dp_rank_at=lambda _: 0)
+        master.workers = [SimpleNamespace(
+            get_configured_kv_cache_blocks=SimpleNamespace(remote=AsyncMock(return_value=6)),
+            prepare_paced_snapshot=SimpleNamespace(remote=AsyncMock(
+                return_value={"requests": 3, "request_slots": 1})),
+        )]
+        master.req_id_generator = iter(range(1, 100))
+        master._poll_error = None
+        master._snapshot_sends = set()
+        master.in_flight_reqs = set()
+        master.request_results = {}
+        self.sent = asyncio.Queue()
+
+        async def send(req_id, input_len, output_len, rank, *, snapshot_index):
+            self.sent.put_nowait((req_id, snapshot_index, rank))
+
+        master.tokenizer = SimpleNamespace(put_single_request=SimpleNamespace(remote=send))
+        await master.start_scheduler(paced_real_decode=True)
+        self.addAsyncCleanup(master.stop_scheduler)
+
+    async def test_slot_backpressure_releases_next_snapshot_with_new_id(self):
+        master = self.master
+        first = master.put_snapshot_request(2, 16, 16)
+        second = master.put_snapshot_request(0, 16, 16)
+        self.assertEqual(await asyncio.wait_for(self.sent.get(), 1), (first.req_id, 2, 0))
+        self.assertIsNotNone(first.admitted_at)
+        self.assertIsNone(second.admitted_at)
+        self.assertEqual(master.dp_scheduler.kv_cache_stats, [3])  # 6 - 1 spare - 2 reserved
+        await master.process_finished_results([SimpleNamespace(req_id=first.req_id)])
+        self.assertEqual(await asyncio.wait_for(self.sent.get(), 1), (second.req_id, 0, 0))
+        self.assertGreaterEqual(second.admitted_at, first.admitted_at)
+        await master.process_finished_results([SimpleNamespace(req_id=second.req_id)])
+        self.assertFalse(master.in_flight_reqs)
+        self.assertEqual(master.dp_scheduler.kv_cache_stats, [5])
+        self.assertEqual(master.dp_scheduler.free_request_slots, {0: 1})
+        with self.assertRaisesRegex(ValueError, "KV blocks"):
+            master.put_snapshot_request(0, 64, 32)
+        with self.assertRaisesRegex(ValueError, "outside the prepared workload"):
+            master.put_snapshot_request(3, 16, 16)
+        self.assertFalse(master.request_results)
+
+    async def test_delivery_failure_reaches_queued_and_dispatched_requests(self):
+        master = self.master
+        master.tokenizer.put_single_request.remote = AsyncMock(side_effect=RuntimeError("send failed"))
+        first = master.put_snapshot_request(0, 16, 16)
+        waiting = master.put_snapshot_request(1, 16, 16)
+        for response in (first, waiting):
+            with self.assertRaisesRegex(RuntimeError, "send failed"):
+                await asyncio.wait_for(response.get(), 1)
+        self.assertIsNone(waiting.admitted_at)
+        with self.assertRaisesRegex(RuntimeError, "Inference service has failed"):
+            master.put_snapshot_request(2, 16, 16)
 
 
 if __name__ == "__main__":

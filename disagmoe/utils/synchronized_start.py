@@ -150,14 +150,21 @@ def cleanup_gate(directory):
 
 
 def validate_configuration(args):
-    """Validate the optional fixed-cohort experiment without importing the runtime."""
+    """Validate snapshot and synchronized-start experiments without importing the runtime."""
     checkpoint = getattr(args, "checkpoint_path", None)
     snapshot = getattr(args, "decode_snapshot", None)
-    if checkpoint or snapshot:
+    paced = getattr(args, "paced_decode", False)
+    synchronized = getattr(args, "synchronized_start", False)
+    window = getattr(args, "arrival_window", None)
+    if window is not None and not paced:
+        raise ValueError("--arrival-window requires --paced-decode")
+    if paced and synchronized:
+        raise ValueError("Choose one of --paced-decode and --synchronized-start")
+    if checkpoint or snapshot or paced:
         if not checkpoint or not snapshot:
             raise ValueError("Real decode requires both --checkpoint-path and --decode-snapshot")
-        if not getattr(args, "synchronized_start", False):
-            raise ValueError("Real decode requires --synchronized-start and a fixed offline cohort")
+        if not synchronized and not paced:
+            raise ValueError("Real decode requires --synchronized-start or --paced-decode")
         if (args.model != "qwen3_30b" or args.num_layers not in (None, 48)
                 or args.num_experts not in (None, 128) or args.topk not in (None, 8)
                 or args.num_kv_heads not in (None, 4) or args.num_gpus != 4):
@@ -170,32 +177,40 @@ def validate_configuration(args):
                 or os.environ.get("DMOE_WEIGHTED_ROUTER_FILE") or args.zigzag_attn
                 or args.step_attn != 1 or args.step_expert != 1):
             raise ValueError("Real decode requires checkpoint routing and standard colocated expert placement")
-    if not getattr(args, "synchronized_start", False):
+    if not (synchronized or paced):
         return
+    mode = "--paced-decode" if paced else "--synchronized-start"
     if getattr(args, "num_nodes", None) != 1 or getattr(args, "placement", None) != "colocate":
-        raise ValueError("--synchronized-start requires single-node colocate placement")
+        raise ValueError(f"{mode} requires single-node colocate placement")
     if getattr(args, "tp_size", None) != 1:
-        raise ValueError("--synchronized-start requires --tp-size 1")
+        raise ValueError(f"{mode} requires --tp-size 1")
     n_gpu = _positive_integer(getattr(args, "num_gpus", None), "num_gpus")
     if getattr(args, "dp_size", None) != n_gpu or getattr(args, "ep_size", None) != n_gpu:
-        raise ValueError("--synchronized-start requires DP = EP = number of GPUs")
-    if getattr(args, "generator_type", None) != "offline":
-        raise ValueError("--synchronized-start requires --generator-type offline")
+        raise ValueError(f"{mode} requires DP = EP = number of GPUs")
+    generator = "uniform" if paced else "offline"
+    if getattr(args, "generator_type", None) != generator:
+        raise ValueError(f"{mode} requires --generator-type {generator}")
     n_requests = _positive_integer(getattr(args, "num_requests", None), "num_requests")
-    if n_requests % n_gpu:
-        raise ValueError("--synchronized-start requires num_requests divisible by DP")
     cap = _positive_integer(getattr(args, "max_batch_size_attn", None), "max_batch_size_attn")
-    if n_requests // n_gpu > cap:
+    if paced:
+        rate = _positive_seconds(args.rate, "--rate")
+        if window is not None and window[1] > n_requests / rate:
+            raise ValueError(f"--arrival-window must end within the offered interval ({n_requests / rate:g}s)")
+        if args.dp_policy not in ("max", "cap_rr"):
+            raise ValueError("--paced-decode requires a capacity-aware --dp-policy of max or cap_rr")
+    elif n_requests % n_gpu:
+        raise ValueError("--synchronized-start requires num_requests divisible by DP")
+    elif n_requests // n_gpu > cap:
         raise ValueError("--synchronized-start initial batch per GPU exceeds max_batch_size_attn")
     for kind in ("input", "output"):
         minimum = _positive_integer(getattr(args, f"min_{kind}_len", None), f"min_{kind}_len")
         if getattr(args, f"max_{kind}_len", None) != minimum + 1:
-            raise ValueError(f"--synchronized-start requires fixed {kind} length: max = min + 1")
+            raise ValueError(f"{mode} requires fixed {kind} length: max = min + 1")
     if (getattr(args, "mode", None) == "server" or getattr(args, "server", False)
             or getattr(args, "is_api_server", False)):
-        raise ValueError("--synchronized-start does not support server mode")
+        raise ValueError(f"{mode} does not support server mode")
     if getattr(args, "analyze_throughput", False):
-        raise ValueError("--synchronized-start does not support --analyze-throughput")
+        raise ValueError(f"{mode} does not support --analyze-throughput")
 
 
 def validate_capacity(kv_stats, blocks_per_request, batch_per_rank):

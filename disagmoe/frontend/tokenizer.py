@@ -17,8 +17,11 @@ def t_now_high_ms() -> int:
 @ray.remote(num_cpus=2, num_gpus=0)
 class Detokenizer:
     
-    def __init__(self, collect_token_ids: bool = False):
+    def __init__(self, collect_token_ids: bool = False, paced_clock: bool = False):
         self.collect_token_ids = collect_token_ids
+        # The single-node paced driver schedules arrivals with perf_counter().
+        # Keep existing timestamps for consumers that use Unix time.
+        self._now_ms = (lambda: time.perf_counter() * 1000) if paced_clock else t_now_high_ms
         self.finished_seqs: Set[int] = set()
         self.active_num_requests = 0
         self.slo_stats: Dict[int, SloStat] = {}
@@ -47,7 +50,7 @@ class Detokenizer:
         return connect_addr
     
     def run(self) -> None:
-        self.last_log_ms = t_now_high_ms()
+        self.last_log_ms = self._now_ms()
         while True:
             batch = self.detokenizer_socket.recv_pyobj()
             with self.lock:
@@ -55,7 +58,7 @@ class Detokenizer:
 
     def process_batch(self, batch: BatchDecodeResult):
         num_tokens = len(batch.req_ids)
-        cur_time_ms = t_now_high_ms()
+        cur_time_ms = self._now_ms()
         self.token_processed += num_tokens
 
         elapsed_ms = cur_time_ms - self.last_log_ms
@@ -165,7 +168,8 @@ class Tokenizer:
         req_id: int,
         init_prefill_len: int,
         max_output_len: int,
-        dp_rank: int
+        dp_rank: int,
+        snapshot_index: Optional[int] = None,
     ) -> None:
         """
         Put a request into the tokenizer queue.
@@ -177,7 +181,7 @@ class Tokenizer:
             tensor: Input tensor (should be 2D)
             dp_rank: Data parallel rank
         """
-        tokenized_req = TokenizedRequest(req_id, init_prefill_len, max_output_len, [0])
+        tokenized_req = TokenizedRequest(req_id, init_prefill_len, max_output_len, [0], snapshot_index)
         self.worker_queues[dp_rank].send_pyobj(tokenized_req)
         self.t_submitted[req_id] = time.time()
         

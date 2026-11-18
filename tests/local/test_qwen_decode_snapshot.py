@@ -58,6 +58,27 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual((dest / "manifest.json").read_text(), "{}")
         self.assertEqual((dest / kv_name(0)).read_bytes(), b"complete")
 
+    @unittest.skipUnless(all(importlib.util.find_spec(x) for x in ("torch", "safetensors")),
+                         "Snapshot KV tests require torch and safetensors")
+    def test_paced_staging_reads_repeated_prompt_once_and_owns_storage(self):
+        import torch
+        from safetensors.torch import save_file
+        from unittest.mock import patch
+
+        self.write_manifest(dict(input_ids=[1, 2], first_token=3, expected_tokens=[4]), repeat=3)
+        kv = torch.ones((2, 2, 2, 1, 8), dtype=torch.bfloat16)
+        save_file({"kv": kv}, str(self.root / kv_name(0)))
+        snapshot = DecodeSnapshot(self.root, self.model)
+        with patch.object(snapshot, "load_kv", wraps=snapshot.load_kv) as read:
+            self.assertEqual(snapshot.stage_kv_on_host(), kv.numel() * kv.element_size())
+            snapshot.stage_kv_on_host()
+            read.assert_called_once_with(0)
+        (self.root / kv_name(0)).unlink()
+        self.assertIs(snapshot.load_kv(0), snapshot.load_kv(2))
+        torch.testing.assert_close(snapshot.load_kv(1), kv)
+        with self.assertRaises(IndexError):
+            snapshot.load_kv(3)
+
     @unittest.skipUnless(all(importlib.util.find_spec(x) for x in ("torch", "safetensors", "transformers")),
                          "Reference test requires torch, safetensors and Qwen3-capable transformers")
     def test_tiny_qwen_prefill_decode_round_trip(self):

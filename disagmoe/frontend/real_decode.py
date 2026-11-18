@@ -6,12 +6,29 @@ import torch
 class DecodeResiduals:
     """Keep one post-attention residual per request until all its experts return."""
 
-    def __init__(self, req_ids, hidden_size, device):
+    def __init__(self, req_ids, hidden_size, device, capacity=None):
+        capacity = len(req_ids) if capacity is None else capacity
+        if capacity < len(req_ids):
+            raise ValueError("Residual capacity is smaller than the initial cohort")
         self.rows = {rid: row for row, rid in enumerate(req_ids)}
         if len(self.rows) != len(req_ids):
             raise ValueError("Duplicate request in decode cohort")
         self.pending_layer = {}
-        self.buffer = torch.empty((len(req_ids), hidden_size), device=device, dtype=torch.bfloat16)
+        self.free_rows = list(range(capacity - 1, len(req_ids) - 1, -1))
+        self.buffer = torch.empty((capacity, hidden_size), device=device, dtype=torch.bfloat16)
+
+    def admit(self, req_id):
+        if req_id in self.rows:
+            raise RuntimeError(f"Duplicate decode request {req_id}")
+        if not self.free_rows:
+            raise RuntimeError("No residual row available for an admitted decode request")
+        self.rows[req_id] = self.free_rows.pop()
+
+    def release(self, req_ids):
+        for rid in req_ids:
+            if rid in self.pending_layer:
+                raise RuntimeError(f"Request {rid} finished with a pending residual")
+            self.free_rows.append(self.rows.pop(rid))
 
     def indices(self, req_ids):
         if len(set(req_ids)) != len(req_ids):
