@@ -4,7 +4,7 @@
 
 ## 测量范围
 
-这是本仓库的实际 GPU 执行路径：四个 Ray Engine、CPU 调度和通信线程、attention、grouped GEMM、dispatch、Top-k 归并等。权重、hidden states 和路由仍是合成数据，没有加载 Qwen checkpoint，也不包含真实 prompt prefill。结果可分析当前实现与硬件上的开销；真实 Qwen 请求的路由、批次分布和文本生成性能还需另行验证。
+这是本仓库的实际 GPU 执行路径：四个 Ray Engine、CPU 调度和通信线程、attention、grouped GEMM、dispatch、Top-k 归并等。本文默认 profile 脚本使用的权重、hidden states 和路由仍是合成数据，没有加载 Qwen checkpoint，也不包含真实 prompt prefill。结果可分析当前实现与硬件上的开销；真实 Qwen 请求的路由、批次分布和文本生成性能还需另行验证。
 
 每个 Engine 单独生成一份报告，覆盖其 Python 和原生线程。driver、tokenizer、detokenizer 进程的 CPU 活动不在这四份报告中；完整请求排队时间和每个 token 的 Top-k 等待也不能仅靠这次 kernel trace 还原。
 

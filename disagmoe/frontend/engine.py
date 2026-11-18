@@ -45,6 +45,7 @@ from typing import Optional, List, Dict, Callable, Tuple, Any, Deque
 from threading import Thread, Event
 from torch import Tensor
 from collections import deque
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 import torch.distributed as dist
 
 from disagmoe_c import (init_disaggregated_engine, init_unified_engine,
@@ -155,13 +156,25 @@ class AttentionEngineMixin:
     
     def preprocess_batch_attn(self, batch: TokenBatchCWrapper) -> Optional[AttentionForwardBatch]:
         schedule_batch = AttentionScheduleBatch.build(batch.metadata, batch.data)
+        residual_indices = None
+        if self.model_config.checkpoint_path:
+            residual_indices = self.decode_residuals.indices(schedule_batch.req_ids)
+            if schedule_batch.layer_id > 0:
+                schedule_batch.data = self.decode_residuals.add_after_experts(
+                    schedule_batch.layer_id - 1, schedule_batch.req_ids, residual_indices,
+                    schedule_batch.data,
+                )
         if schedule_batch.layer_id == self.model_total_num_layers:
             batch_wrapper = self.sample_results(schedule_batch)
-            self.pool.put_batch(batch_wrapper.to_c())
+            if batch_wrapper.data.shape[0] > 0:
+                self.pool.put_batch(batch_wrapper.to_c())
             return None
         
         attn_meta = self._attn_driver_preprocess(schedule_batch.meta_c, schedule_batch)
         positions = schedule_batch.seq_lens_tensor.to(torch.int64)
+        if self.model_config.checkpoint_path:
+            # seq_lens includes the KV slot being written by the current token.
+            positions = positions - 1
         
         if use_gdrcopy_optimization:
             expert_ids_buffer_gdr = self.attn_topk_ids_staging_gdr.get_one_handle()
@@ -188,11 +201,15 @@ class AttentionEngineMixin:
             expert_weights_buffer=expert_weights_buffer,
             expert_ids_buffer_gdr=expert_ids_buffer_gdr,
             expert_weights_buffer_gdr=expert_weights_buffer_gdr,
+            residual_indices=residual_indices,
         )
         return forward_batch
         
     def execute_batch_attn(self, batch: AttentionForwardBatch) -> AttentionForwardResult:
         result = self.attn_executor.execute(batch)
+        if self.model_config.checkpoint_path:
+            self.decode_residuals.save(batch.layer_id, batch.req_ids, batch.residual_indices,
+                                       result.residual)
         sync_event = torch.cuda.Event()
         sync_event.record(self.stream)
         result.sync_event = sync_event
@@ -237,7 +254,10 @@ class AttentionEngineMixin:
         return TokenBatchCWrapper(data=hiddens, metadata=new_meta_c)
     
     def sample_results(self, batch: AttentionScheduleBatch) -> TokenBatchCWrapper:
-        # get_logger().info(f"sampling: layer_id {batch.meta_c.layer_id}, req_ids {batch.seq_ids}")
+        next_ids = None
+        if self.model_config.checkpoint_path:
+            next_ids = self.attn_executor.greedy_token_ids(batch.data)
+        # Both fixed-length workloads count emitted decode tokens (excluding y0).
         continue_ids, finish_req_ids = self.dummy_sampler.sample_once(batch.req_ids)
         continue_meta = batch.meta_c.index_select(continue_ids)
         continue_meta.init_prefill_lens = [-1] * len(continue_ids)
@@ -247,7 +267,7 @@ class AttentionEngineMixin:
         
         batch_res = BatchDecodeResult(
             req_ids=batch.req_ids,
-            token_ids=[0] * len(batch.req_ids),
+            token_ids=next_ids.tolist() if next_ids is not None else [0] * len(batch.req_ids),
             is_eos=[True] * len(batch.req_ids)
         )
         for cont_id in continue_ids:
@@ -256,6 +276,8 @@ class AttentionEngineMixin:
         
         if len(continue_ids) == 0:
             continued_data = batch.data[:0]
+        elif next_ids is not None:
+            continued_data = self.attn_executor.embed_tokens(next_ids[continue_ids])
         elif use_gdrcopy_optimization:
             idx_gdr = self.sample_continue_ids_gdr.get_one_handle()
             idx_gdr.copy_from_host_int64(continue_ids)
@@ -535,6 +557,7 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         self._synchronized_start_status = None
         self._synchronized_start_cancelled = Event()
         self._synchronized_start_labels = False
+        self._real_cohort_reset = None
         self.local_to_gloabl_expert_rank = []
         self.global_to_local_expert_rank = []
         self.device_group_ids = []
@@ -770,6 +793,62 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         # safely reused after some workers have already executed first attention.
         self.end_flag = True
 
+    def reset_real_cohort(self):
+        """Rearm the real benchmark after the controller has all warmup responses."""
+        if not self.model_config.checkpoint_path or self.end_flag or self.loop_error:
+            raise RuntimeError("Cannot rearm a synthetic or stopped engine")
+        if (not self._synchronized_start_status
+                or self._synchronized_start_status["state"] != "executed"
+                or self._real_cohort_reset is not None):
+            raise RuntimeError("A completed synchronized cohort is required before reset")
+        command = Future()
+        self._real_cohort_reset = command
+        try:
+            command.result(timeout=30)
+        except FutureTimeout as exc:
+            self.end_flag = True
+            raise RuntimeError("Inference loop did not acknowledge the cohort reset") from exc
+
+    def _finish_real_cohort_reset(self):
+        # Called only by the inference thread with no pending local forward/postprocess.
+        command = self._real_cohort_reset
+        self._real_cohort_reset = None
+        try:
+            if (self.decode_residuals.pending_layer or self.dummy_sampler.output_len
+                    or self.block_mgr.req_manager.get_active_req_ids()):
+                raise RuntimeError("Cannot rearm real decode while requests are active")
+            self.stream.synchronize()
+            self.decode_residuals = None
+            self._synchronized_start_status = None
+            self._synchronized_start_labels = False
+        except Exception as exc:
+            command.set_exception(exc)
+        else:
+            command.set_result(None)
+
+    def _prepare_snapshot_decode(self, requests, batch):
+        from disagmoe.frontend.real_decode import restore_prompt_kv
+        from disagmoe.utils.decode_snapshot import DecodeSnapshot
+
+        cfg = self.model_config
+        snapshot = DecodeSnapshot(cfg.decode_snapshot, cfg.checkpoint_path)
+        by_id = {r["req_id"]: r for r in requests}
+        # Use the scheduler's actual row order for the block table and first token.
+        blocks = batch.metadata.block_tables.cpu().tolist()
+        layer_buffers = [self.attn_executor.kv_cache.get_kv_buffer(i)
+                         for i in range(cfg.num_layers)]
+        if len(blocks) != len(batch.req_ids):
+            raise ValueError("Initial KV block table must have one row per request")
+        first_tokens = []
+        for rid, pages in zip(batch.req_ids, blocks):
+            request = by_id[rid]
+            index = request["snapshot_index"]
+            if snapshot.prompt_len(index) != request["input_len"]:
+                raise ValueError(f"Snapshot prompt length differs from KV reservation for request {rid}")
+            restore_prompt_kv(snapshot.load_kv(index), layer_buffers, pages)
+            first_tokens.append(snapshot.first_token(index))
+        return torch.tensor(first_tokens, dtype=torch.long, device=self.device)
+
     def _execute_synchronized_start(self):
         """Prepare once on the CUDA-owning thread, then wait for the common CPU gate."""
         from disagmoe.utils.synchronized_start import wait_for_release
@@ -793,8 +872,12 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         for request in requests:
             self.record_max_output_lens(request["req_id"], request["output_len"])
         incoming = TokenBatch_C()
-        incoming.data = torch.rand((count, self.model_config.hidden_size),
-                                   dtype=torch.bfloat16, device=self.device)
+        real_decode = bool(getattr(self.model_config, "checkpoint_path", None))
+        # Real inputs are embedded after release. The native scheduler still
+        # needs a row per request while allocating the initial block tables.
+        initial_tensor = torch.zeros if real_decode else torch.rand
+        incoming.data = initial_tensor((count, self.model_config.hidden_size),
+                                       dtype=torch.bfloat16, device=self.device)
         incoming.metadata = meta.to_c()
         self.pool.put_batch(incoming)
         self._advanced_logger.log_pool_put(count)
@@ -808,11 +891,14 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         if (meta.is_expert() or meta.layer_id != 0 or meta.num_tokens() != count
                 or sorted(meta.req_ids) != sorted(req_ids)):
             raise RuntimeError("Scheduler did not return the complete layer-0 attention cohort")
+        if real_decode:
+            from disagmoe.frontend.real_decode import DecodeResiduals
+            self.decode_residuals = DecodeResiduals(req_ids, self.model_config.hidden_size, self.device)
         forward_batch = self.preprocess_batch(wrapper)
         if forward_batch is None:
             raise RuntimeError("Initial attention preprocessing returned no work")
-        # This one-time synchronization finishes random inputs, KV/metadata
-        # preparation and copies before ready is visible to the controller.
+        first_ids = self._prepare_snapshot_decode(requests, forward_batch) if real_decode else None
+        # Publish ready only after all input/metadata/snapshot copies complete.
         self.stream.synchronize()
         status = dict(status, state="ready", prepared_ns=time.perf_counter_ns())
         self._synchronized_start_status = status
@@ -825,6 +911,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         status = dict(status, state="released", release_ns=release["release_ns"],
                       execute_begin_ns=time.perf_counter_ns())
         self._synchronized_start_status = status
+        if real_decode:
+            forward_batch.data = self.attn_executor.embed_tokens(first_ids)
         if self._nsys_markers_enabled:
             with nvtx_range(f"Engine.execute.attn.layer=0.batch={count}.initial"):
                 result = forward_batch.proc_func(forward_batch)
@@ -1035,6 +1123,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             return
         try:
             new_request: TokenizedRequest = self.tokenizer_socket.recv_pyobj(zmq.NOBLOCK)
+            if self.model_config.checkpoint_path:
+                raise ValueError("Real decode requests require an offline snapshot and synchronized start")
             meta = BatchMetadata(
                 shape=[1, self.model_config.hidden_size],
                 dtype="bfloat16",
@@ -1134,6 +1224,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
 
         try:
             while not self.end_flag:
+                if self._real_cohort_reset is not None and last_batch is None and not result_queue:
+                    self._finish_real_cohort_reset()
                 if (self._synchronized_start_pending is not None
                         and last_batch is None and not result_queue):
                     forward_batch, result = self._execute_synchronized_start()

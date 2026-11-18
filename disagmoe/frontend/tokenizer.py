@@ -17,7 +17,8 @@ def t_now_high_ms() -> int:
 @ray.remote(num_cpus=2, num_gpus=0)
 class Detokenizer:
     
-    def __init__(self):
+    def __init__(self, collect_token_ids: bool = False):
+        self.collect_token_ids = collect_token_ids
         self.finished_seqs: Set[int] = set()
         self.active_num_requests = 0
         self.slo_stats: Dict[int, SloStat] = {}
@@ -90,8 +91,11 @@ class Detokenizer:
                     t_prefill=cur_time_ms,
                     t_prefill_std=cur_time_ms,
                     t_decode=0.0,
-                    t_tokens=[cur_time_ms]
+                    t_tokens=[cur_time_ms],
+                    token_ids=[] if self.collect_token_ids else None,
                 )
+            if self.collect_token_ids:
+                self.slo_stats[rid].token_ids.append(batch.token_ids[i])
         
         self.step_infos.append(SamplerStepInfo(
             num_tokens=num_tokens,

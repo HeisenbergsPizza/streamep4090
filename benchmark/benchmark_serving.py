@@ -196,7 +196,19 @@ def launch(args):
     else:
         raise ValueError(f"Unknown model type: {args.model}")
     
-    model_config = override_model_config_with_args(args, model_config)
+    from copy import copy
+    model_config = override_model_config_with_args(args, copy(model_config))
+    if getattr(args, "checkpoint_path", None):
+        from disagmoe.utils.decode_snapshot import DecodeSnapshot
+        model_config.checkpoint_path = os.path.abspath(os.path.expanduser(args.checkpoint_path))
+        model_config.decode_snapshot = os.path.abspath(os.path.expanduser(args.decode_snapshot))
+        snapshot = DecodeSnapshot(model_config.decode_snapshot, model_config.checkpoint_path)
+        if len(snapshot) != args.num_requests:
+            raise ValueError(f"Snapshot has {len(snapshot)} requests, benchmark requests {args.num_requests}")
+        if any(snapshot.prompt_len(i) != args.min_input_len for i in range(len(snapshot))):
+            raise ValueError("Every snapshot prompt length must equal --min-input-len")
+        if any(not snapshot.expected_tokens(i) for i in range(len(snapshot))):
+            raise ValueError("Export at least one greedy reference step per prompt")
     model_config.ep_size = args.ep_size
     model_config.tp_size = args.tp_size
     model_config.dp_size = args.dp_size
@@ -578,6 +590,19 @@ async def benchmark_warmup(master: Controller, args):
     logger.info("Warmup done.")
 
 def post_benchmark(master, args, results, req_submit_timestamps, req_finish_timestamps, duration):
+    if getattr(args, "checkpoint_path", None):
+        from disagmoe.utils.decode_snapshot import DecodeSnapshot, compare_decode_results
+        report = master.synchronized_start_report
+        snapshot = DecodeSnapshot(report["decode_snapshot"], report["checkpoint_path"])
+        validation = compare_decode_results(snapshot, report["snapshot_index_by_request"],
+                                            results, args.min_output_len)
+        output = os.fspath(args.file) + ".decode.json"
+        with open(output, "w", encoding="utf-8") as handle:
+            json.dump(validation, handle, indent=2)
+        if not validation["matched_reference_prefix"]:
+            raise ValueError(f"Greedy continuation differs from reference on "
+                             f"{validation['mismatched_requests']} requests. Compare tokens in {output}")
+        logger.info(f"Greedy reference prefix matched on all {len(results)} requests: {output}")
     metrics = analyze_results(results, duration)
     
     if args.trace:
@@ -630,7 +655,19 @@ async def benchmark_serving(
     if not is_api_server:
         master.start_polling_results()
         await master.start_scheduler()
-        await benchmark_warmup(master, args)
+        if getattr(args, "checkpoint_path", None):
+            warmup_steps = min(2, args.min_output_len)
+            logger.info(f"Warming up real decode with {warmup_steps} step(s) per request")
+            try:
+                warmup = await master.prepare_synchronized_start(
+                    args.num_requests, args.min_input_len, warmup_steps)
+                await run_synchronized_benchmark(master, args, warmup)
+                await master.reset_real_decode_warmup()
+            except BaseException:
+                await master.abort_synchronized_start()
+                raise
+        else:
+            await benchmark_warmup(master, args)
         
     if args.profile_dir is not None:
         master.init_profile(profile_dir=args.profile_dir)

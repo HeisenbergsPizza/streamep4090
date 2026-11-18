@@ -79,6 +79,32 @@ class SynchronizedBenchmarkLifecycleTest(unittest.IsolatedAsyncioTestCase):
             "torch_profile_stop", "post", "reset",
         ])
 
+    async def test_real_decode_warms_up_from_snapshot_then_reloads_for_measurement(self):
+        self.args.checkpoint_path = "/model"
+        self.args.decode_snapshot = "/snapshot"
+        for key, value in dict(model="qwen3_30b", num_layers=48, num_experts=128,
+                               topk=8, num_kv_heads=4, cuda_graph_attn=False,
+                               cuda_graph_expert=False, serial_gemm=False, expert_wise_schedule=False,
+                               less_than_sm90=True, moe_linear_quant="none", attn_qkv_quant="none",
+                               num_shared_experts=0, gate_profile_file=None, expert_allocation_path=None,
+                               zigzag_attn=False, step_attn=1, step_expert=1).items():
+            setattr(self.args, key, value)
+
+        async def prepare(n, length, steps):
+            self.events.append(("prepare", n, length, steps))
+            return self.responses
+
+        async def reset_warmup():
+            self.events.append("reset_real_cohort")
+
+        self.master.prepare_synchronized_start = prepare
+        self.master.reset_real_decode_warmup = reset_warmup
+        await self.benchmark(self.master, self.args)
+        self.assertEqual(self.events[:8], [
+            "poll", "scheduler_start", ("prepare", 64, 64, 2), "release_and_run",
+            "reset_real_cohort", ("prepare", 64, 64, 32), "capture_start", "release_and_run",
+        ])
+
     async def test_baseline_has_same_prepare_release_without_capture(self):
         self.args.nsys = False
         await self.benchmark(self.master, self.args)

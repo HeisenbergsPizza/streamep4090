@@ -242,6 +242,7 @@ class AttentionForwardBatch(ForwardBatch):
     expert_weights_buffer: Optional[torch.Tensor] = None
     expert_ids_buffer_gdr: Optional[GdrContext] = None
     expert_weights_buffer_gdr: Optional[GdrContext] = None
+    residual_indices: Optional[torch.Tensor] = None
     
     def to_string(self) -> str:
         return f"AttentionForwardBatch(layer_id={self.layer_id}, num_tokens={self.num_tokens}, {self.data.shape}, {self.req_ids})"
@@ -263,6 +264,7 @@ class ForwardResult:
 class AttentionForwardResult(ForwardResult):
     expert_weights: Optional[torch.Tensor]
     expert_ids: Optional[torch.Tensor]
+    residual: Optional[torch.Tensor] = None
 
 @dataclass
 class ExpertForwardResult(ForwardResult):

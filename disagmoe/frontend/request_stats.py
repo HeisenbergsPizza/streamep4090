@@ -14,6 +14,8 @@ class SloStat:
     t_tokens: List[float]
     t_token_timestamps: Optional[List[float]] = None
 
+    token_ids: Optional[List[int]] = None
+
     def post_process(self) -> None:
         self.t_decode = (self.t_decode - self.t_prefill) * 1e-3
         self.t_prefill *= 1e-3

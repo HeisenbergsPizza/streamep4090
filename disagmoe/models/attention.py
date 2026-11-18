@@ -10,6 +10,7 @@ from disagmoe.models.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
 from disagmoe.models.gate import ProfileDrivenRouter
+from disagmoe.models.qwen_decode import qwen_attention
 from disagmoe.ops.memory import permute_tokens_cuda
 from disagmoe.models.experts import SharedExpertMLP
 
@@ -99,6 +100,7 @@ class MoEAttention(nn.Module):
         shared_expert_intermediate_size: Optional[int] = None,
         quant_config_shared: Optional[QuantizationConfig] = None,
         intermediate_size: Optional[int] = None,
+        qwen_norm_eps: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -176,8 +178,13 @@ class MoEAttention(nn.Module):
         else:
             self.profile_driven_router = None
         
-        self.pre_attention_layernorm = RMSNorm(hidden_size)
-        self.post_attention_layernorm = RMSNorm(hidden_size)
+        self.real_qwen = qwen_norm_eps is not None
+        norm_args = {"eps": qwen_norm_eps} if self.real_qwen else {}
+        self.pre_attention_layernorm = RMSNorm(hidden_size, **norm_args)
+        self.post_attention_layernorm = RMSNorm(hidden_size, **norm_args)
+        if self.real_qwen:
+            self.q_norm = RMSNorm(head_dim, **norm_args)
+            self.k_norm = RMSNorm(head_dim, **norm_args)
         
         routing_trace_file_path = os.environ.get("DMOE_WEIGHTED_ROUTER_FILE")
         if routing_trace_file_path is not None and routing_trace_file_path != "":
@@ -237,7 +244,9 @@ class MoEAttention(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor = None,
         request_ids: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
+        if self.real_qwen:
+            return qwen_attention(self, positions, hidden_states, kv_cache, attn_metadata)
         if residual is None:
             residual = hidden_states
             hidden_states = self.pre_attention_layernorm(hidden_states)

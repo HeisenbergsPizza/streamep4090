@@ -11,9 +11,11 @@ from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.layernorm import RMSNorm
 
 from disagmoe.env import ENV_VARS
 from disagmoe.models.attention import MoEAttention
+from disagmoe.models.qwen_checkpoint import QwenCheckpoint, attention_targets, expert_targets
 from disagmoe.models.experts import (
     MoEExpertsCUTLASS,
     MoEExpertsCUTLASSFP8,
@@ -93,6 +95,11 @@ class AttnExecutor(Executor):
         self.block_mgr: BaseBlockManager = None
         self.gate_profile_bytes: Optional[bytes] = gate_profile_bytes
         self.has_profile_gating = gate_profile_bytes is not None and len(gate_profile_bytes) > 0
+        path = getattr(model_config, "checkpoint_path", None)
+        self.checkpoint = QwenCheckpoint(path, model_config) if path else None
+        if self.checkpoint and (self.has_profile_gating or self.enable_cuda_graph
+                                or ENV_VARS.get("DMOE_WEIGHTED_ROUTER_FILE")):
+            raise ValueError("Real Qwen decode requires eager attention and checkpoint router weights")
         
         self.init_model()
         self.init_kv_cache()
@@ -131,6 +138,12 @@ class AttnExecutor(Executor):
             )
             shared_quant_config = None
 
+        real_args = {}
+        if self.checkpoint:
+            cfg = self.checkpoint.config
+            real_args = dict(qwen_norm_eps=cfg["rms_norm_eps"],
+                             rope_theta=cfg["rope_theta"],
+                             max_position=cfg["max_position_embeddings"])
         self.operators = [
             MoEAttention(
                 layer_id,
@@ -147,8 +160,11 @@ class AttnExecutor(Executor):
                 shared_expert_intermediate_size=getattr(self.model_config, "shared_expert_intermediate_size", None),
                 quant_config_shared=shared_quant_config,
                 intermediate_size=getattr(self.model_config, "intermediate_size", None),
-            ) for layer_id in range(self.num_layers)
+                **real_args,
+            ) for layer_id in (self.model_config.layer_ids if self.checkpoint else range(self.num_layers))
         ]
+        if self.checkpoint:
+            self._load_qwen_attention()
         _log_memory_usage("After allocate attention parameters")
 
         # DisagMoE hacks:
@@ -204,6 +220,30 @@ class AttnExecutor(Executor):
                         quant_method, "process_weights_after_loading"):
                     quant_method.process_weights_after_loading(module)
                     
+    def _load_qwen_attention(self):
+        cfg = self.checkpoint.config
+        shape = (cfg["vocab_size"], self.model_config.hidden_size)
+        self.embedding_weight = torch.empty(shape, dtype=self.model_config.dtype, device=self.device)
+        self.lm_head_weight = torch.empty_like(self.embedding_weight)
+        self.final_norm = RMSNorm(self.model_config.hidden_size, eps=cfg["rms_norm_eps"])
+        targets = {
+            "model.embed_tokens.weight": self.embedding_weight,
+            "model.norm.weight": self.final_norm.weight,
+            "lm_head.weight": self.lm_head_weight,
+        }
+        for layer_id, operator in zip(self.model_config.layer_ids, self.operators):
+            targets.update(attention_targets(layer_id, operator))
+        self.checkpoint.load(targets)
+
+    def embed_tokens(self, token_ids):
+        return torch.nn.functional.embedding(token_ids, self.embedding_weight)
+
+    def compute_logits(self, hiddens):
+        return torch.nn.functional.linear(self.final_norm(hiddens), self.lm_head_weight)
+
+    def greedy_token_ids(self, hiddens):
+        return self.compute_logits(hiddens).argmax(dim=-1)
+
     def init_kv_cache(self, use_gpu_block_mgr: bool=False):
         assert not self.cache_config.cache_dtype.startswith("fp8") # flash attn supports only fp16 & bf16
         if self.cache_config.num_gpu_blocks is None:
@@ -310,28 +350,29 @@ class AttnExecutor(Executor):
         hidden_states: Tensor, 
         attn_metadata: FlashAttentionMetadata, 
         request_ids = None
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, ...]:
         if self.has_profile_gating and request_ids is not None and not isinstance(request_ids, Tensor):
             request_ids = torch.tensor(request_ids, dtype=torch.int64, device="cuda")
         
         vid = self.layer_mappings[layer_id]
-        outputs, topk_weights, topk_ids = self.operators[vid].forward(
+        return self.operators[vid].forward(
             positions, 
             hidden_states, 
             self.kv_cache.get_kv_buffer(vid), 
             attn_metadata,
             request_ids=request_ids,
         )
-        return outputs, topk_weights, topk_ids
     
     def execute_normal(self, batch: AttentionForwardBatch) -> AttentionForwardResult:
-        outputs, topk_weights, topk_ids = self.execute_eager(batch.layer_id, batch.positions, batch.data, batch.metadata, request_ids=batch.req_ids)
+        result = self.execute_eager(batch.layer_id, batch.positions, batch.data, batch.metadata, request_ids=batch.req_ids)
+        outputs, topk_weights, topk_ids = result[:3]
         
         return AttentionForwardResult(
             hiddens=outputs,
             expert_weights=topk_weights,
             expert_ids=topk_ids,
             sync_event=None,
+            residual=result[3] if len(result) == 4 else None,
         )
     
     def execute_graph(self, batch: AttentionForwardBatch) -> AttentionForwardResult:
@@ -375,6 +416,8 @@ class AttnExecutor(Executor):
     @staticmethod
     def build(model_config: ModelConfig, cache_config: DmoeCacheConfig, gate_profile_bytes: Optional[bytes] = None) -> "Executor":
         if model_config.tp_size > 1:
+            if getattr(model_config, "checkpoint_path", None):
+                raise ValueError("Real Qwen decode requires attention TP1")
             return ParallelAttnExecutor(model_config, cache_config, gate_profile_bytes=gate_profile_bytes)
         else:
             return AttnExecutor(model_config, cache_config, gate_profile_bytes=gate_profile_bytes)
@@ -414,6 +457,10 @@ class ExpertsExecutor(Executor):
             get_logger().info(f"Enabled CUDA graphs for experts, need to capture graphs.")
             
         self.expert_cls = self.get_expert_cls()
+        checkpoint_path = getattr(self.model_config, "checkpoint_path", None)
+        if checkpoint_path and (self.expert_cls is not MoEExpertsCUTLASS or
+                                get_global_engine_config().enable_cuda_graph_expert):
+            raise ValueError("Real Qwen decode requires eager BF16 CUTLASS experts")
         
         for _ in range(self.num_layers):
             if self.expert_cls is MoEExpertsSerial:
@@ -436,6 +483,13 @@ class ExpertsExecutor(Executor):
                     )
                 )
                         
+        if checkpoint_path:
+            checkpoint = QwenCheckpoint(checkpoint_path, self.model_config)
+            targets = {}
+            for layer_id, operator in zip(self.model_config.layer_ids, self.operators):
+                targets.update(expert_targets(layer_id, operator, self.local_to_global_expert_rank))
+            checkpoint.load(targets)
+
     def get_expert_cls(self):
         cfg = get_global_engine_config()
         if not cfg.enable_grouped_gemm:

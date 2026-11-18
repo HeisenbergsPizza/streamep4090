@@ -151,6 +151,25 @@ def cleanup_gate(directory):
 
 def validate_configuration(args):
     """Validate the optional fixed-cohort experiment without importing the runtime."""
+    checkpoint = getattr(args, "checkpoint_path", None)
+    snapshot = getattr(args, "decode_snapshot", None)
+    if checkpoint or snapshot:
+        if not checkpoint or not snapshot:
+            raise ValueError("Real decode requires both --checkpoint-path and --decode-snapshot")
+        if not getattr(args, "synchronized_start", False):
+            raise ValueError("Real decode requires --synchronized-start and a fixed offline cohort")
+        if (args.model != "qwen3_30b" or args.num_layers not in (None, 48)
+                or args.num_experts not in (None, 128) or args.topk not in (None, 8)
+                or args.num_kv_heads not in (None, 4) or args.num_gpus != 4):
+            raise ValueError("Real decode requires the full Qwen3-30B-A3B model on four GPUs")
+        if (args.cuda_graph_attn or args.cuda_graph_expert or args.serial_gemm
+                or args.expert_wise_schedule or not args.less_than_sm90
+                or args.moe_linear_quant != "none" or args.attn_qkv_quant != "none"):
+            raise ValueError("Real decode currently uses eager BF16 CUTLASS (--less-than-sm90)")
+        if (args.num_shared_experts or args.gate_profile_file or args.expert_allocation_path
+                or os.environ.get("DMOE_WEIGHTED_ROUTER_FILE") or args.zigzag_attn
+                or args.step_attn != 1 or args.step_expert != 1):
+            raise ValueError("Real decode requires checkpoint routing and standard colocated expert placement")
     if not getattr(args, "synchronized_start", False):
         return
     if getattr(args, "num_nodes", None) != 1 or getattr(args, "placement", None) != "colocate":

@@ -257,6 +257,84 @@ class _RemoteMethod:
         return self.function(*args)
 
 
+class RealTokenFeedbackTest(unittest.TestCase):
+    def test_reset_rejects_inflight_residual_and_rearms_drained_worker(self):
+        from concurrent.futures import Future
+        ns = {"Future": Future, "FutureTimeout": TimeoutError}
+        worker = _source_class("disagmoe/frontend/engine.py", "Engine",
+                               ("reset_real_cohort", "_finish_real_cohort_reset"), ns)()
+        worker._synchronized_start_status = {"state": "executed"}
+        worker._real_cohort_reset = None
+        worker.model_config = SimpleNamespace(checkpoint_path="/model")
+        worker.loop_error = None
+        worker.end_flag = False
+        worker.decode_residuals = SimpleNamespace(pending_layer={7: 3})
+        worker.dummy_sampler = SimpleNamespace(output_len={})
+        worker.block_mgr = SimpleNamespace(req_manager=SimpleNamespace(get_active_req_ids=lambda: []))
+        drained = threading.Event()
+        worker.stream = SimpleNamespace(synchronize=drained.set)
+
+        def acknowledge():
+            deadline = time.monotonic() + 2
+            while worker._real_cohort_reset is None and time.monotonic() < deadline:
+                time.sleep(0.001)
+            if worker._real_cohort_reset is not None:
+                worker._finish_real_cohort_reset()
+
+        thread = threading.Thread(target=acknowledge)
+        thread.start()
+        with self.assertRaisesRegex(RuntimeError, "requests are active"):
+            worker.reset_real_cohort()
+        thread.join()
+        self.assertFalse(drained.is_set())
+        worker.decode_residuals.pending_layer.clear()
+        thread = threading.Thread(target=acknowledge)
+        thread.start()
+        worker.reset_real_cohort()
+        thread.join()
+        self.assertTrue(drained.is_set())
+        self.assertIsNone(worker.decode_residuals)
+        self.assertIsNone(worker._synchronized_start_status)
+
+    def test_reordered_requests_emit_ids_and_only_embed_continuing_rows(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("CPU PyTorch needed to exercise real token feedback")
+        ns = {"AttentionScheduleBatch": object, "TokenBatchCWrapper": SimpleNamespace,
+              "BatchDecodeResult": SimpleNamespace, "List": list, "Tuple": tuple,
+              "Dict": dict, "use_gdrcopy_optimization": False}
+        engine = _source_class("disagmoe/frontend/engine.py", "AttentionEngineMixin",
+                               ("sample_results",), ns)()
+        engine.dummy_sampler = _source_class("disagmoe/frontend/engine.py", "DummySampler",
+                                              ("__init__", "sample_once", "create_request",
+                                               "clean_request", "check_end"), ns)()
+        engine.dummy_sampler.create_request(71, 1)
+        engine.dummy_sampler.create_request(19, 2)
+        engine.attn_dp_rank = 0
+        engine.model_config = SimpleNamespace(checkpoint_path="/model")
+        reported, freed = [], []
+        engine.detokenizer_socket = SimpleNamespace(send_pyobj=reported.append)
+        engine.release_seqs = freed.extend
+        engine.attn_executor = SimpleNamespace(greedy_token_ids=lambda x: x.argmax(-1),
+                                               embed_tokens=lambda ids: (ids + 10).unsqueeze(1))
+        def sample(req_ids, rows):
+            meta = SimpleNamespace(index_select=lambda indices: SimpleNamespace(
+                req_ids=[req_ids[j] for j in indices]))
+            return engine.sample_results(SimpleNamespace(req_ids=req_ids, meta_c=meta,
+                                                         data=torch.tensor(rows)))
+
+        nxt = sample([19, 71], [[0., 3., 1.], [3., 2., 1.]])
+        self.assertEqual((reported[0].token_ids, reported[0].is_eos), ([1, 0], [False, True]))
+        self.assertEqual(nxt.metadata.req_ids, [19])
+        self.assertEqual(nxt.data.tolist(), [[11]])
+        self.assertEqual(freed, [71])
+        last = sample([19], [[0., 1., 2.]])
+        self.assertEqual((reported[1].token_ids, reported[1].is_eos), ([2], [True]))
+        self.assertEqual(last.data.shape[0], 0)
+        self.assertEqual(freed, [71, 19])
+
+
 class _Worker:
     def __init__(self, rank):
         self.rank = rank
@@ -343,6 +421,19 @@ class ControllerSynchronizedStartTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         if self.controller._synchronized_start_gate:
             await self.controller.abort_synchronized_start()
+
+    async def test_real_cohort_leaves_append_headroom_and_maps_snapshot_by_dp_rank(self):
+        self.controller.model_config.checkpoint_path = "/model"
+        self.controller.model_config.decode_snapshot = "/snapshot"
+        self.controller.dp_scheduler.kv_cache_stats[0] = 96
+        with self.assertRaisesRegex(ValueError, "spare KV block on DP rank 0"):
+            await self.controller.prepare_synchronized_start(64, 64, 32)
+        self.assertFalse(self.controller.in_flight_reqs)
+        self.controller.dp_scheduler.kv_cache_stats[0] = 97
+        await self.controller.prepare_synchronized_start(64, 64, 32)
+        for w in self.controller.workers:
+            self.assertEqual([r["snapshot_index"] for r in w.requests],
+                             list(range(w.rank * 16, (w.rank + 1) * 16)))
 
     async def test_capacity_checks_every_rank_before_allocating_any_request(self):
         # One rank is short by one block although the other three have room.

@@ -80,7 +80,7 @@ class Controller:
         tokenizer_ports = [TOKENIZER_PORT_BASE + i for i in range(self.model_config.dp_size)]
         self.tokenizer_addrs = ray.get(self.tokenizer.init_tokenizer_sockets.remote(tokenizer_ports, self.host_ifname))
         
-        self.detokenizer = Detokenizer.remote()
+        self.detokenizer = Detokenizer.remote(collect_token_ids=bool(self.model_config.checkpoint_path))
         detokenizer_port = DETOKENIZER_PORT_BASE
         self.detokenizer_addr = ray.get(self.detokenizer.init_detokenizer_socket.remote(detokenizer_port, self.host_ifname))
             
@@ -468,6 +468,18 @@ class Controller:
         blocks = self.dp_scheduler.required_blocks(input_len, output_len)
         # Check the full cohort on EVERY rank before allocating a single ID.
         validate_capacity(self.dp_scheduler.kv_cache_stats, blocks, count)
+        if getattr(self.model_config, "decode_snapshot", None):
+            block_size = self.cache_config.block_size
+            final_pages = (input_len + output_len + block_size - 1) // block_size
+            prompt_pages = (input_len + block_size - 1) // block_size
+            # Native append_tokens requires strictly more free blocks than it appends.
+            # Registrations may already over-reserve for a partially filled prompt page.
+            if final_pages > prompt_pages:
+                stats = self.dp_scheduler.kv_cache_stats
+                for rank in range(dp_size):
+                    if stats[rank] <= count * final_pages:
+                        raise ValueError(f"Real decode needs one spare KV block on DP rank {rank} "
+                                         f"when appending the final decode page")
         gate = create_gate()
         self._synchronized_start_gate = gate
         cohorts = [[] for _ in range(dp_size)]
@@ -480,7 +492,10 @@ class Controller:
                     self.request_results[req_id] = response
                     self._synchronized_start_responses.append(response)
                     self.dp_scheduler.add_seq(req_id, input_len, output_len, rank)
-                    cohorts[rank].append(dict(req_id=req_id, input_len=input_len, output_len=output_len))
+                    request = dict(req_id=req_id, input_len=input_len, output_len=output_len)
+                    if getattr(self.model_config, "decode_snapshot", None):
+                        request["snapshot_index"] = rank * count + len(cohorts[rank])
+                    cohorts[rank].append(request)
             await asyncio.wait_for(asyncio.gather(*[
                 worker.arm_synchronized_start.remote(gate, cohorts[rank])
                 for worker, rank in zip(self.workers, ranks)
@@ -504,6 +519,14 @@ class Controller:
                 "workers": statuses, "worker_identities": identities,
                 "timing_window": "common release deadline to all responses received; preparation excluded",
             }
+            if getattr(self.model_config, "decode_snapshot", None):
+                self.synchronized_start_report.update(
+                    workload="Qwen3-30B-A3B greedy decode from prefilled KV; fixed decode steps",
+                    checkpoint_path=self.model_config.checkpoint_path,
+                    decode_snapshot=self.model_config.decode_snapshot,
+                    snapshot_index_by_request={r["req_id"]: r["snapshot_index"]
+                                               for cohort in cohorts for r in cohort},
+                )
             return list(self._synchronized_start_responses)
         except BaseException:
             try:
@@ -543,6 +566,16 @@ class Controller:
             workers=statuses, cpu_start_skew_ms=(max(starts) - min(starts)) / 1e6)
         cleanup_gate(self._synchronized_start_gate["directory"])
         self._synchronized_start_gate = None
+
+    async def reset_real_decode_warmup(self):
+        if (not self.model_config.checkpoint_path or self._synchronized_start_gate is not None
+                or self.synchronized_start_report is None or self.in_flight_reqs
+                or self.request_results or self.dp_scheduler.seq_ranks):
+            raise RuntimeError("Cannot reset until the real decode warmup cohort has completed")
+        await asyncio.gather(*[worker.reset_real_cohort.remote() for worker in self.workers])
+        await self.detokenizer.reset.remote()
+        self.synchronized_start_report = None
+        self._synchronized_start_responses = []
 
     async def abort_synchronized_start(self):
         """Cancel this one-shot experiment and undo controller-side reservations."""

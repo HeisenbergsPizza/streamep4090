@@ -43,7 +43,38 @@ def parse_configuration(argv=None):
         "--max-output-len", "9" if options.mode == "smoke" else "33", "--file", report,
     ]
     cli_args = defaults + extra
-    args = cli.get_parser_base().parse_args(cli_args)
+    parser = cli.get_parser_base()
+    args = parser.parse_args(cli_args)
+    if args.checkpoint_path and args.decode_snapshot:
+        if options.mode != "benchmark":
+            wrapper.error("Real Qwen decode uses benchmark mode")
+        sys.path.insert(0, str(REPO))
+        from disagmoe.utils.decode_snapshot import DecodeSnapshot
+        checkpoint_path = str(Path(args.checkpoint_path).expanduser().resolve())
+        snapshot_path = str(Path(args.decode_snapshot).expanduser().resolve())
+        try:
+            snapshot = DecodeSnapshot(snapshot_path, checkpoint_path)
+            lengths = {snapshot.prompt_len(i) for i in range(len(snapshot))}
+            if len(lengths) != 1:
+                raise ValueError("Real decode currently requires equal prompt lengths")
+            length = lengths.pop()
+            steps = min(len(snapshot.expected_tokens(i)) for i in range(len(snapshot)))
+            if steps < 1:
+                raise ValueError("Export at least one greedy reference step per prompt")
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            wrapper.error(f"Invalid real-decode workload: {exc}")
+        defaults += [
+            "--synchronized-start", "--generator-type", "offline",
+            "--num-requests", str(len(snapshot)),
+            "--min-input-len", str(length), "--max-input-len", str(length + 1),
+            "--min-output-len", str(steps), "--max-output-len", str(steps + 1),
+            "--max-batch-size-attn", str(max(16, len(snapshot) // 4)),
+            "--max-batch-size-expert", "512", "--unified-scheduler-type", "defrag",
+        ]
+        cli_args = defaults + extra + ["--checkpoint-path", checkpoint_path, "--decode-snapshot", snapshot_path]
+        args = parser.parse_args(cli_args)
+        if args.num_requests != len(snapshot) or args.min_input_len != length:
+            wrapper.error("Request count and input length must agree with the snapshot")
     for field, expected in {"model": "qwen3_30b", "num_nodes": 1, "num_gpus": 4, "dp_size": 4, "ep_size": 4, "tp_size": 1, "placement": "colocate", "transport": "zmq"}.items():
         if getattr(args, field) != expected:
             wrapper.error(f"This launcher requires {field}={expected}")
@@ -69,7 +100,7 @@ def parse_configuration(argv=None):
         wrapper.error("Use either --nsys or --profile-dir, not both CUPTI collectors")
     if args.nsys and options.mode == "server":
         wrapper.error("Nsight capture supports one smoke/benchmark run per launch; use benchmark mode")
-    if args.synchronized_start:
+    if args.synchronized_start or args.checkpoint_path or args.decode_snapshot:
         if options.mode == "server":
             wrapper.error("--synchronized-start supports one smoke/benchmark cohort; use benchmark mode")
         # Keep dry-run independent of the GPU/runtime package imports.
