@@ -1,5 +1,28 @@
 # 单卡 Expert 算子对照与 Nsight Compute 采集
 
+## 测单个 expert 的 batch–耗时曲线
+
+在已能运行 StreamInfer 的 CUDA 环境中，从仓库根目录运行下面的命令。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python experiments/scripts/ops/sweep_expert_batch.py
+```
+
+横轴是**送入同一层、同一个 expert 的 token 行数**。默认使用 Qwen3-30B-A3B 的形状（hidden 2048、expert intermediate 768）及随机 BF16 权重。脚本复用该 expert，预热每个形状，再用 CUDA Event 记录 20 次 eager forward 的中位耗时。计时包含 gate/up 投影、SiLU 门控乘法和 down 投影，CUTLASS 路径还包含两次 metadata kernel。路由、跨卡通信和输入准备都在计时范围外。
+
+脚本根据所选 GPU 启动时的空闲显存预留 20%，扣除权重并估算各行激活占用，依次测量 1、2、4、8 等 batch 和估算终点。遇到 CUDA OOM 会停止增长，保存此前成功的点。终端打印最大实测 batch，CSV 和 PNG 默认保存在 `reports/expert-batch/<时间戳>/`。
+
+只看曲线可以加 `--max-batch-size 1024`。要给模拟器准备查找表，下面的命令会逐个测量 1 到 512 范围内显存允许的 batch。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python experiments/scripts/ops/sweep_expert_batch.py \
+  --dense --max-batch-size 512 --output-dir reports/expert-qwen-b512
+```
+
+测满 1 至 512 后，可将该目录的 `expert_latency.csv` 传给模拟器的 `--expert-profile`，用于 expert cap 不超过 512 的实验。默认倍增扫描只覆盖抽样点。这里的 `time_ms` 是单个 expert 完整前向的实测值；使用该表时，模拟器仍按本地各 expert 的负载分别查表并求和。
+
+## 对照 StreamInfer 和 SGLang 的 kernel
+
 这组脚本比较 StreamInfer 的 BF16 CUTLASS expert 与 SGLang **0.5.9** 的 Triton expert。两边读取同一个测试文件，复用相同输入、语义等价的权重、路由和路由权重。它运行一层、一个 EP rank 的本地计算，不启动服务、Ray、NCCL 或 Nsight Systems，也不读取完整模型权重。
 
 新增入口：
