@@ -58,6 +58,19 @@ bash experiments/scripts/rtx4090/launch.sh benchmark \
 
 首个输出 `y0` 已由 prefill 选出。快照有 64 个 prompt token 时，StreamInfer 在位置 64 输入 `y0`，写入该位置的 KV，并输出 `y1`。四次实测前向贡献四个输出（`y1…y4`）。prefill、权重加载、KV 导入和预热都在计时窗口外。ITL 从本轮实际输出的相邻 token 时间计算。
 
+### 定位 greedy 前缀分歧
+
+如果运行保存了 `*.decode.json` 并报告前缀不一致，可以在导出快照的 Transformers 环境里单独复查。以下命令假定 `MODEL`、`RUN_DIR` 和 `OUT` 分别指向原 checkpoint、快照的父目录和这次失败实验的输出目录。
+
+```bash
+source /workspace/zzc/sglang-qwen30b/activate.sh
+CUDA_VISIBLE_DEVICES=0,1,2,3 python experiments/scripts/rtx4090/diagnose_qwen_decode.py \
+  --model-dir "$MODEL" --decode-snapshot "$RUN_DIR/snapshot" \
+  --decode-report "$OUT/rate-4.csv.decode.json" > "$OUT/rate-4.hf-margins.jsonl"
+```
+
+脚本仅回放有分歧的请求，每条都从快照 KV 和 prefill token 开始，逐步输入共同前缀，到首处分歧即停止。先确认 `hf_reference_reproduced_through_step` 为真，再解读 `hf_streaminfer_rank` 和 `hf_reference_minus_streaminfer_logit`。排名为 1 且分差为 0 表示两个候选在本次 HF 输出中并列最高。若排名靠后或分差较大，可以挑出相应请求用 StreamInfer 单独复现。报告中的分数均来自 HF；要定位 StreamInfer 从哪一层开始偏离，还需对比两边的中间结果。
+
 ## 3. 扩大到原来的负载
 
 用 512 行**各自恰好 64 个 token** 的真实输入重新导出，设 `--repeat 1`，输出到新目录。若已有 SGLang 实验输入，直接复用对应的 `input_ids`。四个重复 prompt 的测试只用于验证链路，不能用来估计真实 prompt 集的专家负载偏斜。
