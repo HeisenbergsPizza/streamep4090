@@ -2,6 +2,18 @@
 
 实验用同一份本地 BF16 checkpoint。Transformers 计算一次 prompt prefill，导出每层 KV、首个输出 token 和一段 greedy 参考序列。StreamInfer 用自己的 Attention、CUTLASS expert 和异步调度执行后续 decode。当前入口支持单节点四卡、Attention DP4 / EP4 / TP1、等长 prompt、固定步数和 eager 执行。
 
+从旧 checkout 更新时需要重新编译 `disagmoe_c` 才能使用多请求 top-k 分发修复。旧版扩展将不同请求的 ID 与专家输入行错配，尤其容易在使用不同 prompt 的混合 batch 时暴露。可以复用原来的 prefill 快照。在已配置好的 `streamep4090` 环境和仓库根目录执行：
+
+```bash
+export PYTHON=python
+source experiments/scripts/rtx4090/common.sh
+rtx4090_env
+rtx4090_libraries
+mkdir -p "$TMPDIR"
+MAX_JOBS=4 python -m pip install -e . --no-build-isolation --no-deps
+python -m pytest -q tests/ops/test_token_routing.py -k topk_metadata_and_hidden_rows_stay_together
+```
+
 ## 1. 导出一个小样本
 
 在服务器仓库根目录运行。使用支持 Qwen3 MoE 的参考环境，需有 CUDA PyTorch、Transformers、Accelerate 和 safetensors。导出器只读本地模型。以下命令用同一个 prompt 准备四个独立请求，方便检查不同 GPU 得到的结果。

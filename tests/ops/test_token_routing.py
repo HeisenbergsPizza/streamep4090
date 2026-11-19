@@ -47,6 +47,42 @@ def test_permutation_and_top8_scatter(width, topk):
     torch.testing.assert_close(actual[mappings.long()], expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("topk", [2, 8])
+def test_topk_metadata_and_hidden_rows_stay_together(topk):
+    from disagmoe_c import BatchMetadata
+
+    req_ids = [101, 207, 13]
+    lengths = [64, -1, 32]
+    ranks = [2, 0, 1]
+    meta = BatchMetadata()
+    meta.shape = [3, 2048]
+    meta.req_ids = req_ids
+    meta.init_prefill_lens = lengths
+    meta.attn_dp_ranks = ranks
+    meta.topk_weights = [1.0] * len(req_ids)
+    tokens = _tokens(len(req_ids), 2048)
+    meta.duplicate_topk(topk)
+
+    # Unequal routes exercise shared experts across requests and the inverse
+    # mapping from a flattened router entry to its expert-sorted GPU row.
+    routes = [((7 * row + 3 * branch) % 16, (row * topk + branch + 1) / 32, row)
+              for row in range(len(req_ids)) for branch in range(topk)]
+    meta.exp_ids = [expert for expert, _, _ in routes]
+    meta.topk_weights = [weight for _, weight, _ in routes]
+    destinations = meta.sort_by_expert()
+    mappings = torch.tensor(destinations, device="cuda", dtype=torch.int32)
+    dispatched = torch.ops.disag_ops.permute_tokens(tokens, mappings)
+
+    for source, (expert, weight, row) in enumerate(routes):
+        dest = destinations[source]
+        assert meta.req_ids[dest] == req_ids[row]
+        assert meta.init_prefill_lens[dest] == lengths[row]
+        assert meta.attn_dp_ranks[dest] == ranks[row]
+        assert meta.exp_ids[dest] == expert
+        assert meta.topk_weights[dest] == weight
+        torch.testing.assert_close(dispatched[dest], tokens[row], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("width", [17, 132, 2048, 2051])
 def test_weighted_permutation_uses_each_source_weight_once(width):
     tokens = _tokens(5, width)

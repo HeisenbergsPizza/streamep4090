@@ -183,6 +183,9 @@ def resolve_expert_allocation(
 def launch(args):
     from disagmoe.utils.synchronized_start import validate_configuration
     validate_configuration(args)
+    if getattr(args, "checkpoint_path", None):
+        from disagmoe.utils.runtime_checks import validate_native_topk_order
+        validate_native_topk_order(c)
     # Select transport in C++ backend (default from CLI is zmq)
     c.select_transport(args.transport)
     cluster_config = ClusterConfig(n_node=args.num_nodes, n_gpu=args.num_gpus)

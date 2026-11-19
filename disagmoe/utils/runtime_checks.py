@@ -1,6 +1,19 @@
-"""Capacity checks that do not require importing CUDA or the native extension."""
+"""Runtime checks shared by the benchmark and its deployment tests."""
 
 import math
+
+
+def validate_native_topk_order(native):
+    """Check the loaded extension before allocating Qwen weights on the workers."""
+    meta = native.BatchMetadata()
+    meta.shape = [2, 1]
+    meta.req_ids = [11, 22]
+    meta.duplicate_topk(2)
+    if meta.req_ids != [11, 11, 22, 22]:
+        raise RuntimeError(
+            f"Loaded disagmoe_c expands top-k request IDs as {meta.req_ids}. "
+            f"Rebuild the extension from the updated checkout (loaded {native.__file__})."
+        )
 
 
 def kv_cache_block_budget(total_bytes, free_bytes, utilization, block_bytes):

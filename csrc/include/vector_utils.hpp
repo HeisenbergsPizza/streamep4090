@@ -18,8 +18,9 @@ template<class T>
 inline std::vector<T> duplicate_vector(const std::vector<T> &a, int times) {
     std::vector<T> res;
     res.reserve(a.size() * times);
-    for (int i = 0; i < times; i++) {
-        res.insert(res.end(), a.begin(), a.end());
+    // Flattened gate outputs and the CUDA scatter both use row * topk + branch.
+    for (const auto& value : a) {
+        res.insert(res.end(), times, value);
     }
     return res;
 }

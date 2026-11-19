@@ -162,7 +162,14 @@ void TensorLocalChannel::recv_batch(const torch::Tensor &data, const BatchMetada
         c.wait(lock);
     }
     torch::Tensor data_to_recv = batch_buffer.front();
-    cudaMemcpyAsync((void *)data.data_ptr(), (void*) data_to_recv.data_ptr(), metadata.num_element() * metadata.get_datatype_size(), cudaMemcpyKind::cudaMemcpyDeviceToDevice, this->stream);
+    // The sender can release its tensor before this receive-side copy finishes.
+    // Keep its allocation live on the stream that actually reads the source.
+    c10::cuda::CUDACachingAllocator::recordStream(
+        data_to_recv.storage().data_ptr(),
+        c10::cuda::getStreamFromExternal(this->stream, data_to_recv.get_device()));
+    CUDACHECK(cudaMemcpyAsync(data.data_ptr(), data_to_recv.data_ptr(),
+        metadata.num_element() * metadata.get_datatype_size(),
+        cudaMemcpyDeviceToDevice, this->stream));
     batch_buffer.pop();
 }
 
