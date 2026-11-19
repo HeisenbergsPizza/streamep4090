@@ -4,7 +4,9 @@ ray = importlib.import_module("ray")
 import torch
 import os
 import asyncio
+import json
 import time
+from pathlib import Path
 from functools import partial
 
 PlacementGroupSchedulingStrategy = importlib.import_module(
@@ -344,6 +346,21 @@ class Controller:
 
     def fetch_step_stats(self) -> List[Tuple[List[StepInfo], Dict[int, List[TraceContext]], Metric]]:
         return ray.get([worker.fetch_step_stats.remote() for worker in self.workers])
+
+    def dump_scheduler_choices(self, start_ns, end_ns, submitted_s, finished_s, args):
+        directory = Path(args.scheduler_choices_dir).expanduser().resolve()
+        ranks = ray.get([worker.dump_scheduler_choices.remote(str(directory), start_ns, end_ns)
+                         for worker in self.workers])
+        if sorted(ranks) != sorted(self.device_ids):
+            raise RuntimeError(f"Scheduler choices returned by unexpected devices: {ranks}")
+        manifest = dict(format="streaminfer.scheduler_choices.v1", start_ns=start_ns, end_ns=end_ns,
+                        device_ids=sorted(ranks), num_layers=self.model_config.num_layers,
+                        generator_type=args.generator_type, rate=args.rate,
+                        submitted_s=submitted_s, finished_s=finished_s, configuration=vars(args))
+        # Publish the manifest only after every worker has closed its CSV.
+        temp = directory / "run.json.tmp"
+        temp.write_text(json.dumps(manifest, allow_nan=False) + "\n", encoding="utf-8")
+        temp.replace(directory / "run.json")
 
     def dump_advanced_logs(self, suffix: str = "", output_dir: str = "./advanced_logs"):
         """Tell each worker to dump its advanced logs to disk locally, then

@@ -162,6 +162,8 @@ def main():
     global master, args
     parser = get_parser_base()
     args = parser.parse_args()
+    if args.scheduler_choices_dir is not None:
+        parser.error("--scheduler-choices-dir requires a dedicated benchmark run")
     
     logger.info("Launching DisagMoE Controller")
     

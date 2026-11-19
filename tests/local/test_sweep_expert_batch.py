@@ -14,8 +14,14 @@ finally:
 
 
 class ExpertBatchSweepTest(unittest.TestCase):
-    def test_sweep_includes_the_endpoint_once(self):
-        for limit, expected in ((1, [1]), (4, [1, 2, 4]), (7, [1, 2, 4, 7])):
+    def test_sweep_steps_by_50_and_includes_the_endpoint_once(self):
+        for limit, expected in (
+            (0, []),
+            (1, [1]),
+            (50, [1, 50]),
+            (51, [1, 51]),
+            (102, [1, 51, 101, 102]),
+        ):
             with self.subTest(limit=limit):
                 self.assertEqual(list(sweep.batch_sizes(limit)), expected)
 

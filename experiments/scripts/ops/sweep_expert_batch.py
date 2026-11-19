@@ -19,11 +19,8 @@ def batch_limit(free_bytes, hidden, intermediate, max_batch_size):
 
 
 def batch_sizes(limit):
-    size = 1
-    while size < limit:
-        yield size
-        size *= 2
-    if limit:
+    yield from range(1, limit, 50)
+    if limit > 0:
         yield limit
 
 
@@ -52,7 +49,7 @@ def measure(expert, batch, use_cutlass, warmup, iterations):
     return statistics.median(samples)
 
 
-def plot_curve(rows, title, path):
+def plot_curve(rows, title, path, *, ylabel="Median forward latency (ms)"):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -61,9 +58,8 @@ def plot_curve(rows, title, path):
     sizes, times = zip(*rows)
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(sizes, times, marker="." if len(rows) > 50 else "o")
-    ax.set_xscale("log", base=2)
     ax.set(yscale="log", xlabel="Tokens in one expert",
-           ylabel="Median forward latency (ms)", title=title)
+           ylabel=ylabel, title=title)
     ax.grid(True, which="both", alpha=0.25)
     fig.tight_layout()
     fig.savefig(path, dpi=160)
@@ -129,7 +125,7 @@ def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog="Default batches: 1, 51, 101, ... and the final limit.")
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=768)
     parser.add_argument("--max-batch-size", type=int, help="Cap the memory-based sweep at this batch size.")

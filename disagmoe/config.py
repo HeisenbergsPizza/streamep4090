@@ -66,6 +66,7 @@ class EngineConfig:
     enable_advanced_logging: bool = False
     advanced_logging_dir: str = "./advanced_logs"
     advanced_logging_sample_rate: float = 0.1
+    scheduler_choices_dir: Optional[str] = None
     
 @dataclass
 class CacheConfig(vllm.config.CacheConfig):

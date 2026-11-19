@@ -16,7 +16,7 @@ from disagmoe.config import (
 )
 from disagmoe.frontend.datatypes import SloStat, TraceContext, SamplerStepInfo
 from workload import PoissonGenerator, Workload, UniformGenerator, DatasetGenerator, get_generator
-from utils import get_parser_base
+from utils import get_parser_base, validate_scheduler_choices
 import disagmoe_c as c
 from disagmoe.utils.logger import new_logger
 from typing import List, Dict, Tuple, Optional, Sequence, Union
@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import os
 import pickle
+from pathlib import Path
 
 master: Controller = None
 logger = new_logger("Serving")
@@ -183,6 +184,11 @@ def resolve_expert_allocation(
 def launch(args):
     from disagmoe.utils.synchronized_start import validate_configuration
     validate_configuration(args)
+    validate_scheduler_choices(args)
+    choices_dir = getattr(args, "scheduler_choices_dir", None)
+    if choices_dir is not None:
+        choices_dir = str(Path(choices_dir).expanduser().resolve())
+        Path(choices_dir).mkdir(parents=True, exist_ok=False)
     if getattr(args, "checkpoint_path", None):
         from disagmoe.utils.runtime_checks import validate_native_topk_order
         validate_native_topk_order(c)
@@ -244,6 +250,7 @@ def launch(args):
         enable_advanced_logging=getattr(args, "enable_advanced_logging", False),
         advanced_logging_dir=getattr(args, "advanced_logging_dir", "./advanced_logs"),
         advanced_logging_sample_rate=getattr(args, "advanced_logging_sample_rate", 0.1),
+        scheduler_choices_dir=choices_dir,
     )
 
     global master
@@ -533,7 +540,8 @@ async def run_benchmark(master: Controller, args,
         generator = GeneratorType(rate, 1, min_input_len, max_input_len, min_output_len, max_output_len)
     workload = generator.generate_num(num_requests)
     pbar = tqdm.tqdm(total=num_requests)
-    t_start = time.perf_counter()
+    start_ns = time.perf_counter_ns()
+    t_start = start_ns / 1e9
     tasks = []
     req_submit_timestamps = []
     req_finish_timestamps = []
@@ -548,7 +556,8 @@ async def run_benchmark(master: Controller, args,
         tasks.append(asyncio.create_task(process_response(resp, req_finish_timestamps, pbar)))
     
     results: List[SloStat] = await asyncio.gather(*tasks)
-    t_duration = time.perf_counter() - t_start
+    end_ns = time.perf_counter_ns()
+    t_duration = (end_ns - start_ns) / 1e9
     pbar.close()
     
     if warmup:
@@ -559,6 +568,10 @@ async def run_benchmark(master: Controller, args,
     req_finish_timestamps.sort()
     for i in range(num_requests):
         req_finish_timestamps[i] -= t_start
+
+    if getattr(args, "scheduler_choices_dir", None) is not None:
+        # All responses are in; writing diagnostics is outside the timed workload.
+        master.dump_scheduler_choices(start_ns, end_ns, req_submit_timestamps, req_finish_timestamps, args)
 
     return results, req_submit_timestamps, req_finish_timestamps, t_duration
 

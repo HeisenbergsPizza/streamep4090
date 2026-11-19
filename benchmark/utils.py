@@ -103,6 +103,8 @@ def add_cluster_arguments(parser: ArgumentParser):
     parser.add_argument("-g", "--num-gpus", type=int, default=4, help="number of gpus per node")
     
 def add_analysis_arguments(parser: ArgumentParser):
+    parser.add_argument("--scheduler-choices-dir", metavar="DIR",
+                        help="write each nonempty local scheduler choice and formal request timings to a new directory")
     parser.add_argument("-p", "--profile-dir", type=str, default=None, help="directory to store torch profiler output")
     parser.add_argument("--nsys", action="store_true", help="enable nsys profiling")
     parser.add_argument("-f", "--file", type=str, default="reports/benchmark.csv", help="file to write benchmark results")
@@ -115,6 +117,17 @@ def add_analysis_arguments(parser: ArgumentParser):
     parser.add_argument("--enable-advanced-logging", action="store_true", default=False, help="enable advanced logging for MoE diagnostics")
     parser.add_argument("--advanced-logging-dir", type=str, default="./advanced_logs", help="output directory for advanced logs")
     parser.add_argument("--advanced-logging-sample-rate", type=float, default=0.1, help="fraction of MoE steps to instrument (0.0-1.0)")
+
+
+def validate_scheduler_choices(args, *, server=False):
+    if getattr(args, "scheduler_choices_dir", None) is None:
+        return
+    if (server or args.num_nodes != 1 or args.placement != "colocate"
+            or args.tp_size != 1 or args.expert_wise_schedule):
+        raise ValueError("--scheduler-choices-dir uses the single-node colocated TP1 layer-wise benchmark")
+    if (args.generator_type != "uniform" or args.synchronized_start or args.checkpoint_path
+            or args.decode_snapshot or args.paced_decode or not math.isfinite(args.rate) or args.rate <= 0):
+        raise ValueError("--scheduler-choices-dir needs a synthetic uniform workload with a positive arrival rate")
 
 def get_parser_base():
     parser = ArgumentParser()

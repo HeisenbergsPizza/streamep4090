@@ -188,6 +188,40 @@ trace 中可搜索：
 
 该模式仍执行合成 decode，使用随机权重和 hidden states；上述命令默认使用随机路由，已有路由配置仍生效。未增加真实 Qwen checkpoint 或 prompt prefill。
 
+### 3.2 固定到达率下看每次调度选中的队列
+
+以四卡合成 decode 为例，按 12 req/s 等间隔投放 512 个请求，每个请求从 64 个上下文 token 开始，执行 128 步。使用 defrag 调度，attention cap 为 128，expert cap 为 512，两侧都开启 CUDA Graph。以下命令在服务器仓库根目录执行，`choices` 使用四个 Ray worker 都能写入的新目录，由程序创建。
+
+```bash
+cd "$HOME/guest0/projects/Qwen3/streamep4090"
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda activate streamep4090
+export DMOE_RAY_TMPDIR=/workspace/zzc/ray
+export RUN_TIMEOUT_SECONDS=1800
+OUT="/workspace/zzc/streamep4090/reports/scheduler-rate12-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$OUT"
+
+bash experiments/scripts/rtx4090/launch.sh benchmark \
+  --generator-type uniform --rate 12 --num-requests 512 \
+  --min-input-len 64 --max-input-len 65 \
+  --min-output-len 128 --max-output-len 129 \
+  --unified-scheduler-type defrag \
+  --max-batch-size-attn 128 --max-attn-graph-bsz 128 \
+  --max-batch-size-expert 512 --cuda-graph-attn --cuda-graph-expert \
+  --gpu-usage 0.80 --analyze-throughput --analyze-throughput-window 10,40 \
+  --scheduler-choices-dir "$OUT/choices" --file "$OUT/metrics.csv"
+
+python experiments/scripts/rtx4090/plot_scheduler_choices.py \
+  --run-dir "$OUT/choices" --start-s 20 --duration-ms 200 \
+  --output "$OUT/choices-20s.png"
+```
+
+示例画出正式负载开始后 `[20.000, 20.200)` 秒内四张卡的选择。上图显示整轮 driver 已提交且尚未完成的请求数，灰色区域为最后一次提交后的排空期。下方每个点代表对应 Engine 的 CPU 调度器取出的一个非空 batch。颜色和符号区分 Attention、Expert 和最后的 Finalize 队列，纵轴与模拟图一样从第 0 层向下排列。原始 `choices/choices-gpu-*.csv` 还保留了每次取出的 batch 大小。点与点之间仍可能有 GPU 计算或通信在运行。要只看一张卡，可以在绘图命令中加 `--gpu 1` 并换一个输出文件名。调整起点和窗口长度即可用同一份记录查看其他时段。要核对 GPU kernel 的实际耗时和重叠，仍应查看 Nsight 时间线。
+
+稳定性要结合整轮的请求与输出记录判断。本例的最后一个计划到达时刻为 `511 / 12 ≈ 42.58` 秒。在 `$OUT/rate=12.0/` 中，可以从 `req_submit_time.csv` 的累计提交数减去 `req_finish_time.csv` 的累计完成数，得到该时刻的未完成请求数。再用 `sampler_step.csv` 查看邻近几秒的输出 token/s。选取投放仍在继续、吞吐相近且未完成请求数没有持续上升的区间。若始终积压，第 20 秒可以作为负载增长期间的样本。要观察稳态，可调低到达率或延长投放以复核。吞吐参数 `--analyze-throughput-window` 的时间起点取首个采样输出，与绘图使用的正式负载起点有偏移。
+
+之前用 `profile.sh trace` 采集的固定到达率报告里，`Engine.execute` 通常没有层号，`Engine.schedule.sample_1_in_64` 也只覆盖部分调度轮询。要还原每个非空 batch 的队列，需要用上面的开关重新记录。该图展示队列被选中的时刻；旧报告和本图都不能据此给出每个候选队列当时的积压深度。
+
 ## 4. 输出与查看
 
 默认每次写入新的 `reports/rtx4090/profile-<mode>-<time>-<pid>/`：

@@ -118,6 +118,10 @@ def parse_configuration(argv=None):
             sync_start.validate_configuration(args)
         except ValueError as exc:
             wrapper.error(str(exc))
+    try:
+        cli.validate_scheduler_choices(args, server=options.mode == "server")
+    except ValueError as exc:
+        wrapper.error(str(exc))
     return options, args, cli_args
 
 

@@ -22,6 +22,7 @@ from disagmoe.ops.memory import (
     apply_weights_and_permute_tokens_cuda as apply_weights_and_permute_tokens,
 )
 from disagmoe.utils.logger import initialize_logger, get_logger
+from disagmoe.utils.scheduler_choices import SchedulerChoices
 from disagmoe.frontend.profiler import EngineProfilerMixin
 from disagmoe.utils.utils import (get_ip, get_nccl_url_from_uid, time_ms, Timer,
                                   make_seqlens_cuda_tensor, get_graph_batch_size, StepInfo, 
@@ -562,6 +563,7 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         self.profiler = None
         self.profile_dir = None
         self._nsys_profile_active = False
+        self._scheduler_choices = None
         self._nsys_markers_enabled = os.environ.get("DMOE_ENABLE_NVTX", "0") == "1"
         self._synchronized_start_pending = None
         self._synchronized_start_status = None
@@ -1019,6 +1021,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         set_global_engine_config(engine_config)
         
         self.model_total_num_layers = model_config.num_layers
+        if getattr(engine_config, "scheduler_choices_dir", None):
+            self._scheduler_choices = SchedulerChoices(self.model_total_num_layers)
         
         if self.has_attn:
             context = zmq.Context(2)
@@ -1243,12 +1247,21 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             pass
 
     def _schedule_batch_with_optional_trace(self):
-        if not self._advanced_logger.enabled:
-            return self.scheduler.schedule(), None
-        if not use_gdrcopy_optimization:
-            return self.scheduler.schedule(), None
-        trace = self.scheduler.schedule_trace()
-        return trace.batch, trace.pool_snapshot
+        trace = None
+        if self._advanced_logger.enabled and use_gdrcopy_optimization:
+            trace = self.scheduler.schedule_trace()
+            batch = trace.batch
+        else:
+            batch = self.scheduler.schedule()
+        if self._scheduler_choices is not None and batch.data is not None:
+            self._scheduler_choices.record(time.perf_counter_ns(), batch.metadata)
+        return batch, trace.pool_snapshot if trace is not None else None
+
+    def dump_scheduler_choices(self, output_dir, start_ns, end_ns):
+        if self._scheduler_choices is None:
+            raise RuntimeError("Scheduler choice recording was not enabled on this worker")
+        self._scheduler_choices.dump(output_dir, self.device_id, start_ns, end_ns)
+        return self.device_id
 
     @torch.inference_mode()
     def single_module_loop_overlap(self):
