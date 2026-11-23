@@ -1,4 +1,5 @@
 #include "pool.h"
+#include "worker_gap_trace.hpp"
 
 UnifiedPool::UnifiedPool(
     std::vector<int> layer_ids,
@@ -15,7 +16,17 @@ UnifiedPool::UnifiedPool(
     int num_layers = static_cast<int>(layer_ids.size());
     int num_attn_layers = num_layers + 1;
     int num_expert_layers = num_layers;
-    if (unified_scheduler_type == "defrag") {
+    const char* gap_worker = GapTracedDefragScheduler::worker();
+    if (gap_worker && std::to_string(device_id) == gap_worker) {
+        if (unified_scheduler_type != "defrag") {
+            throw std::invalid_argument("Worker gap tracing requires the defrag scheduler");
+        }
+        auto traced = std::make_shared<GapTracedDefragScheduler>(
+            num_attn_layers, num_expert_layers, top_k, defrag_lookback_steps,
+            defrag_lookahead_steps, defrag_weight_decay);
+        traced->begin_trace();
+        this->layer_scheduler = std::move(traced);
+    } else if (unified_scheduler_type == "defrag") {
         this->layer_scheduler = std::make_shared<UnifiedDefraggingLayerScheduler>(
             num_attn_layers,
             num_expert_layers,

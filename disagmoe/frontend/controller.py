@@ -68,6 +68,7 @@ class Controller:
         self._synchronized_start_responses = []
         self.synchronized_start_report = None
         self.enable_nsys = enable_nsys
+        self._nsys_targets = []
         self.expert_wise_schedule = expert_wise_schedule
         self.host_ifname = host_ifname
         self.nccl_ib_hca = nccl_ib_hca
@@ -118,7 +119,11 @@ class Controller:
                 "env_vars": worker_env_vars,
             }
             
-            if self.enable_nsys:
+            gap_rank = os.environ.get("DMOE_GAP_WORKER")
+            profile_worker = self.enable_nsys and (gap_rank is None or int(gap_rank) == bundle_id)
+            if profile_worker:
+                if gap_rank is not None:
+                    worker_env_vars["DMOE_GAP_WORKER"] = gap_rank
                 from disagmoe.utils.nsys_profile import make_nsight_config
                 workers_env["nsight"] = make_nsight_config(
                     cpu_sampling=os.environ.get("DMOE_NSYS_CPU_SAMPLING", "0") == "1")
@@ -138,6 +143,10 @@ class Controller:
             node_id = node_ids[worker_ip]
             
             device_id = node_id * self.n_gpu_per_node + cur_device_on_worker
+            if profile_worker:
+                if gap_rank is not None and device_id != int(gap_rank):
+                    raise RuntimeError("Single-node Nsight target differs from its Ray GPU bundle")
+                self._nsys_targets.append(worker)
             worker.set_device_id.remote(device_id)
             
             self.workers.append(worker)
@@ -688,11 +697,11 @@ class Controller:
     def start_nsys_profile(self):
         if self.enable_nsys:
             self.nsys_workers = ray.get([
-                worker.start_nsys_profile.remote() for worker in self.workers])
+                worker.start_nsys_profile.remote() for worker in self._nsys_targets])
 
     def stop_nsys_profile(self):
         if self.enable_nsys:
-            ray.get([worker.stop_nsys_profile.remote() for worker in self.workers])
+            ray.get([worker.stop_nsys_profile.remote() for worker in self._nsys_targets])
         
     def init_profile(
         self, 

@@ -243,6 +243,9 @@ class AttentionEngineMixin:
             expert_ids = result.expert_ids.flatten().tolist()
             expert_weights = result.expert_weights.flatten().tolist()
         
+        replay = self.attn_executor.shared_top8
+        if replay is not None and replay.audit_file is not None:
+            replay.audit_dispatch(batch.layer_id, batch.req_ids, batch.metadata.seq_lens, expert_ids)
         new_meta_c.exp_ids = expert_ids
         new_meta_c.topk_weights = expert_weights
         exp_mappings = new_meta_c.sort_by_expert()
@@ -563,6 +566,7 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         self.profiler = None
         self.profile_dir = None
         self._nsys_profile_active = False
+        self._gap_worker = False
         self._scheduler_choices = None
         self._nsys_markers_enabled = os.environ.get("DMOE_ENABLE_NVTX", "0") == "1"
         self._synchronized_start_pending = None
@@ -964,6 +968,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
             with torch.cuda.device(self.device):
                 torch.cuda.profiler.start()
             self._nsys_profile_active = True
+            if getattr(self, "_gap_worker", False):
+                torch.cuda.nvtx.mark(f"WG.clock={time.perf_counter_ns()}")
         return {
             "pid": os.getpid(),
             "device_id": self.device_id,
@@ -975,6 +981,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         """Close this actor's capture range without adding a hot-path sync."""
         if not self._nsys_profile_active:
             return
+        if getattr(self, "_gap_worker", False):
+            torch.cuda.nvtx.mark(f"WG.clock={time.perf_counter_ns()}")
         with torch.cuda.device(self.device):
             torch.cuda.profiler.stop()
         self._nsys_profile_active = False
@@ -985,6 +993,7 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
 
     def set_device_id(self, device_id: int):
         self.device_id = device_id
+        self._gap_worker = os.environ.get("DMOE_GAP_WORKER") == str(device_id)
         
     def set_hosts(self, device_2_host: Dict[int, str]):
         device_2_host[self.device_id] = "0.0.0.0"
@@ -1287,6 +1296,11 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
         _inf_had_last = 0
         _inf_t_window = time.perf_counter()
         _schedule_profile_count = 0
+        # Counts match native unified defrag's successful claims, including warmup.
+        gap_worker = self._gap_worker
+        gap_id = 0
+        previous_gap_id = None
+        next_clock = 0.0
 
         try:
             while not self.end_flag:
@@ -1302,6 +1316,9 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                     continue
                 _inf_iter_count += 1
                 _it_t0 = time.perf_counter()
+                if gap_worker and _it_t0 >= next_clock:
+                    torch.cuda.nvtx.mark(f"WG.clock={time.perf_counter_ns()}")
+                    next_clock = _it_t0 + 1
                 self._drain_moe_events()
                 self._drain_transport_stats()
                 self.recv_new_request()
@@ -1317,6 +1334,9 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                     batch, _trace_snapshot = self._schedule_batch_with_optional_trace()
                 forward_batch = None
                 if batch.data is not None:
+                    if gap_worker:
+                        gap_id += 1
+                        torch.cuda.nvtx.range_push(f"WG.work={gap_id}")
                     _sched_ms = (time.perf_counter() - _sched_t0) * 1000.0
                     idle_conunt = 0
                     batch_wrapper = TokenBatchCWrapper.from_c(batch)
@@ -1349,6 +1369,13 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                         else:
                             result = forward_batch.proc_func(forward_batch)
                         result_queue.append((forward_batch, result))
+                    if gap_worker:
+                        torch.cuda.nvtx.range_pop()
+                        if forward_batch is None:
+                            # Finalize returns directly from preprocess, without
+                            # the completion event used by Attention and Expert.
+                            torch.cuda.nvtx.mark(f"WG.finalize={gap_id}")
+                            torch.cuda.nvtx.mark(f"WG.retire={gap_id}")
                     self.step_profile(batch.metadata.num_tokens())
                     _inf_proc_ns += int((time.perf_counter() - _proc_t0) * 1e9)
                     _inf_had_batch += 1
@@ -1367,6 +1394,10 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                             else:
                                 sync_event_timeout(tmp_result.sync_event)
                             tmp_result.sync_event = None
+                        if gap_worker:
+                            # The existing event wait has returned. This timestamp
+                            # bounds completion of the previous batch from above.
+                            torch.cuda.nvtx.mark(f"WG.retire={previous_gap_id}")
                         if self._nsys_markers_enabled:
                             with nvtx_range("Engine.postprocess"):
                                 final_result = tmp_batch.post_proc_func(tmp_batch, tmp_result)
@@ -1380,6 +1411,8 @@ class Engine(AttentionEngineMixin, ExpertEngineMixin, EngineProfilerMixin):
                 _inf_post_ns += int((time.perf_counter() - _post_t0) * 1e9)
 
                 last_batch = forward_batch
+                if gap_worker:
+                    previous_gap_id = gap_id if forward_batch is not None else None
 
                 if _inf_iter_count % 500 == 0:
                     _now = time.perf_counter()

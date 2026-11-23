@@ -14,6 +14,7 @@ import random
 
 from .metrics import Samples
 from .overheads import BatchOverheadModel, add_overhead_arguments, overhead_config_from_args
+from .profiling.bundle import add_bundle_input, parse_simulator_args
 
 
 def _positive_int(value):
@@ -52,7 +53,7 @@ def build_parser():
                         help="async expert candidate granularity; expert is a simulation-only extension")
     parser.add_argument("--synthetic", action="store_true", help="generate explicitly synthetic routing/cost fixtures")
     parser.add_argument("--routing-profile", type=Path)
-    parser.add_argument("--expert-profile", type=Path)
+    add_bundle_input(parser)
     parser.add_argument("--attention-profile", type=Path,
                         help="pure-decode batch/context CSV in milliseconds; optional component column")
     parser.add_argument("--grouped-profile", type=Path)
@@ -324,7 +325,7 @@ def _plot_cdf(series, output_dir, synthetic):
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_simulator_args(parser, argv)
     try:
         overhead_config = overhead_config_from_args(args)
         overhead_description = BatchOverheadModel(
@@ -337,6 +338,8 @@ def main(argv=None):
         parser.error("--weight-decay must be between 0 and 1")
     if args.mode != "async" and args.policies is not None:
         parser.error("--policies applies only to --mode async")
+    if args.mode != "async" and args.overhead_model == "pipeline":
+        parser.error("pipeline models the asynchronous worker; choose --mode async")
     if args.mode != "async" and args.overhead_model == "structural":
         parser.error("structural overhead needs buffer provenance; use simulation.steady_experiment "
                      "--mode sync|tbo or sim_async.run_simulation(execution_mode=...) for shared baselines")
@@ -396,6 +399,10 @@ def main(argv=None):
         "metric_scope": "finite decode-only workload; ITL is adjacent completion gap, excluding token_index=0",
         "comparison_invariants": "same routing, compute profiles, overhead assumptions, topology, arrival seed and workload across policies",
     }
+    if args.profile_bundle:
+        provenance["profile_bundle"] = args.profile_bundle_info
+        if {"network_latency_us", "network_bandwidth_gbps"} <= args.profile_bundle_info["applied_parameters"].keys():
+            provenance["cost_assumptions"]["network"] = "bundle_fitted_single_host_receive_fifo"
     _write_json(output_dir / "inputs.json", {"configuration": vars(args), "provenance": provenance})
     summaries, series = [], []
     for policy in policies:

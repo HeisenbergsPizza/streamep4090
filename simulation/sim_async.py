@@ -92,6 +92,15 @@ class Join:
     input_rows: list[tuple[int, int]] = field(default_factory=list)
 
 
+@dataclass
+class PendingResult:
+    """A submitted worker batch awaiting the engine's FIFO retirement."""
+    trace: dict
+    items: list
+    gpu_done: simpy.Event | None
+    post_ticks: float
+
+
 def _validate_workload_overrides(sim):
     arrivals = getattr(sim, "arrival_times_ms", None)
     mapping = getattr(sim, "routing_request_indices", None)
@@ -186,6 +195,14 @@ class GPUWorker:
         self.finalize_batches = Counter()
         self.expert_batches = Counter()
         self.expert_individual_batches = Counter()
+        self.pipeline = getattr(getattr(sim, "overhead_model", None), "preset", None) == "pipeline"
+        if self.pipeline:
+            self.stream_tail = None
+            self.stream_available = 0.0
+            self.host_phase = None
+            self.gpu_phase = None
+            self.host_phase_ticks = Counter()
+            self.gpu_phase_ticks = Counter()
         self.process = self.env.process(self.run())
 
     def wake(self):
@@ -221,6 +238,7 @@ class GPUWorker:
         return attn, expert, oldest
 
     def run(self):
+        previous = None
         while True:
             if self.expert_scheduling == "expert":
                 # Initialize once to also support directly preloaded test queues.
@@ -245,6 +263,12 @@ class GPUWorker:
                 oldest = self.snapshot()[2] if self.scheduler.policy == "fifo" else None
                 decision = self.scheduler.select(attn, expert, oldest)
             if decision is None:
+                if previous is not None:
+                    # The real loop retires its previous result even when the
+                    # current poll finds nothing. Publication can wake this rank.
+                    yield from self.retire(previous)
+                    previous = None
+                    continue
                 self.wakeup = self.env.event()
                 yield self.wakeup
                 continue
@@ -256,10 +280,10 @@ class GPUWorker:
             if stage == "attention":
                 queue = self.attention[layer]
                 items = [queue.popleft() for _ in range(min(len(queue), self.sim.attn_batch_cap))]
-                tokens = [item[0] for item in items]
+                batch_size = len(items)
                 if self.queue_trace is not None:
-                    self.queue_trace.change(self.env.now, self.rank, layer, -len(tokens))
-                self.sim.ready_attention -= len(tokens)
+                    self.queue_trace.change(self.env.now, self.rank, layer, -batch_size)
+                self.sim.ready_attention -= batch_size
                 for token, ready_at in items:
                     wait = started - ready_at
                     if layer == self.sim.num_layers:
@@ -271,13 +295,12 @@ class GPUWorker:
                 if self.observer is not None:
                     name = "finalize_ready_wait" if layer == self.sim.num_layers else "attention_ready_wait"
                     self.observer.metric(self.env.now, name, (started - ready_at for _, ready_at in items))
-                contexts = [self.sim.initial_context + token.token_index for token in tokens]
                 if layer == self.sim.num_layers:
-                    duration = len(tokens) * self.sim.finalize_t
+                    duration = batch_size * self.sim.finalize_t
                 else:
+                    contexts = [self.sim.initial_context + token.token_index for token, _ in items]
                     attention_estimate = self.sim.attention_cost.evaluate(contexts)
                     duration = attention_estimate.total_ticks
-                batch_size = len(tokens)
                 (self.finalize_batches if layer == self.sim.num_layers else self.attention_batches)[batch_size] += 1
             else:
                 queues = self.experts[layer]
@@ -304,10 +327,10 @@ class GPUWorker:
                 for take in loads:
                     if take:
                         self.expert_individual_batches[take] += 1
-                branches = [item[0] for item in items]
+                batch_size = len(items)
                 if self.queue_trace is not None:
-                    self.queue_trace.change(self.env.now, self.rank, self.sim.num_layers + 1 + layer, -len(branches))
-                self.sim.ready_expert -= len(branches)
+                    self.queue_trace.change(self.env.now, self.rank, self.sim.num_layers + 1 + layer, -batch_size)
+                self.sim.ready_expert -= batch_size
                 for branch, ready_at in items:
                     wait = started - ready_at
                     self.sim.stats["expert_ready_wait"].add(wait)
@@ -315,13 +338,12 @@ class GPUWorker:
                 if self.observer is not None:
                     self.observer.metric(self.env.now, "expert_ready_wait", (started - ready_at for _, ready_at in items))
                 duration = self.sim.expert_cost(loads)
-                batch_size = len(branches)
                 self.expert_batches[batch_size] += 1
             if not math.isfinite(duration) or duration < 0:
                 raise ValueError("compute cost must be finite and nonnegative")
             compute_stage = "finalize" if layer == self.sim.num_layers else stage
-            service = self.batch_service(compute_stage, duration, batch_size,
-                                         items=items, candidate_queues=len(attn) + len(expert))
+            service = self.batch_service(compute_stage, duration, batch_size, items=items,
+                                         candidate_queues=len(attn) + len(expert), layer=layer)
             duration = service.total_ticks
             trace = {
                 "gpu": self.rank, "stage": compute_stage,
@@ -334,12 +356,14 @@ class GPUWorker:
                 "selected_queue_index": self.scheduler.last_selected_index,
             }
             self.add_overhead_trace(trace, service)
+            if self.pipeline:
+                self.plan_pipeline(trace, service)
             if attention_estimate is not None:
                 # Planned cost breakdown, not a measured sub-kernel timeline.
                 trace["attention_context_mean"] = attention_estimate.context_mean
                 trace["attention_components_ticks"] = attention_estimate.components_ticks
             capture_details = getattr(self.sim, "should_capture_schedule_details", None)
-            if capture_details is None or capture_details(started, started + duration):
+            if capture_details is None or capture_details(started, trace["end"]):
                 if self.expert_scheduling == "expert":
                     self.scheduler.materialize_details()
                 trace["queue_snapshot"] = self.scheduler.last_snapshot[:]
@@ -348,26 +372,121 @@ class GPUWorker:
             token_trace = getattr(self, "token_trace", None)
             token_trace_batch_id = (token_trace.batch_selected(trace, items)
                                     if token_trace is not None else None)
-            yield from self.execute_service(compute_stage, service, token_trace_batch_id)
-            if token_trace is not None:
-                token_trace.batch_completed(token_trace_batch_id, self.env.now)
-            if getattr(self.sim, "track_fragments", False):
-                self.sim.mark_batch_output(compute_stage, items)
-            if stage == "attention":
-                if layer == self.sim.num_layers:
-                    for token in tokens:
-                        self.sim.complete(token)
-                else:
-                    self.sim.dispatch(self.rank, layer, tokens)
+            if self.pipeline:
+                current = yield from self.issue(trace, items, service, token_trace_batch_id)
+                if compute_stage == "finalize":
+                    # Native Finalize publishes inline. Conservatively require
+                    # its gathered data and modeled sampling output to be ready.
+                    yield from self.retire(current)
+                    current = None
+                if previous is not None:
+                    yield from self.retire(previous)
+                previous = current
             else:
-                # Return communication is independent of the compute resource.
-                destinations = defaultdict(list)
-                for branch in branches:
-                    destinations[branch.token.home_gpu].append(branch)
-                for dst, outgoing in destinations.items():
-                    self.sim.send(self.rank, dst, outgoing, returning=True)
+                yield from self.execute_service(compute_stage, service, token_trace_batch_id)
+                if token_trace is not None:
+                    token_trace.batch_completed(token_trace_batch_id, self.env.now)
+                self.publish(trace, items)
 
-    def batch_workload(self, stage, items, candidate_queues):
+    def publish(self, trace, items):
+        stage = trace["stage"]
+        if getattr(self.sim, "track_fragments", False):
+            self.sim.mark_batch_output(stage, items)
+        if stage == "finalize":
+            for token, _ in items:
+                self.sim.complete(token)
+        elif stage == "attention":
+            self.sim.dispatch(self.rank, trace["layer"], [token for token, _ in items])
+        else:
+            destinations = defaultdict(list)
+            for branch, _ in items:
+                destinations[branch.token.home_gpu].append(branch)
+            for dst, outgoing in destinations.items():
+                self.sim.send(self.rank, dst, outgoing, returning=True)
+
+    def plan_pipeline(self, trace, service):
+        """At reservation all predecessors of this rank's FIFO submissions are known."""
+        gather_submit = trace["start"] + service.cpu_dequeue_ticks
+        compute_submit = gather_submit + service.cpu_prelaunch_ticks
+        stream_ready = self.stream_available
+        gather_start = gather_end = None
+        if service.reformation_raw_ticks:
+            gather_start = max(gather_submit, stream_ready)
+            gather_end = gather_start + service.reformation_raw_ticks
+            stream_ready = gather_end
+        # A host-only Finalize consumes already-ready inputs and publishes inline.
+        # With no gather or modeled terminal GPU work it must not fence another batch.
+        host_only = trace["stage"] == "finalize" and not (service.reformation_raw_ticks or service.base_compute_ticks)
+        compute_start = compute_submit if host_only else max(compute_submit, stream_ready)
+        compute_end = compute_start + service.base_compute_ticks
+        if not host_only:
+            self.stream_available = compute_end
+        trace.update(gather_submit=gather_submit, gather_start=gather_start, gather_end=gather_end,
+                     host_only_finalize=host_only, compute_submit=compute_submit, compute_start=compute_start,
+                     compute_end=compute_end,
+                     gpu_start=compute_start if gather_start is None else gather_start, end=compute_end,
+                     post_start=None, post_end=None, output_ready=None)
+
+    def host_service(self, phase, duration):
+        if duration:
+            self.host_phase = (phase, self.env.now)
+            yield self.env.timeout(duration)
+            self.host_phase_ticks[phase] += duration
+            self.host_phase = None
+
+    def gpu_segment(self, previous, stage, phase, duration, token_batch_id, first):
+        if previous is not None and not previous.processed:
+            yield previous
+        if first and self.token_trace is not None:
+            self.token_trace.batch_gpu_started(token_batch_id, self.env.now)
+        if duration:
+            self.current_compute = (stage, self.env.now, duration)
+            self.gpu_phase = (phase, self.env.now)
+            yield self.env.timeout(duration)
+            self.busy_time += duration
+            self.busy_by_stage[stage] += duration
+            self.gpu_phase_ticks[phase] += duration
+            self.current_compute = self.gpu_phase = None
+        if phase == "compute" and self.token_trace is not None:
+            self.token_trace.batch_completed(token_batch_id, self.env.now)
+
+    def issue(self, trace, items, service, token_batch_id):
+        stage = trace["stage"]
+        yield from self.host_service("dequeue", service.cpu_dequeue_ticks)
+        gather = service.reformation_raw_ticks
+        if gather:
+            self.stream_tail = self.env.process(self.gpu_segment(
+                self.stream_tail, stage, "gather", gather, token_batch_id, first=True))
+        # GPU gather can run while the engine prepares arguments / submits the
+        # model kernels. Both submissions use a single in-order compute stream.
+        yield from self.host_service("prelaunch", service.cpu_prelaunch_ticks)
+        if trace["host_only_finalize"]:
+            if self.token_trace is not None:
+                # The trace's terminal-stage boundary has zero GPU service.
+                self.token_trace.batch_gpu_started(token_batch_id, self.env.now)
+                self.token_trace.batch_completed(token_batch_id, self.env.now)
+            return PendingResult(trace, items, None, service.cpu_post_ticks)
+        self.stream_tail = self.env.process(self.gpu_segment(
+            self.stream_tail, stage, "compute", service.base_compute_ticks, token_batch_id,
+            first=not gather))
+        return PendingResult(trace, items, self.stream_tail, service.cpu_post_ticks)
+
+    def retire(self, batch):
+        if batch.gpu_done is not None and not batch.gpu_done.processed:
+            yield batch.gpu_done
+        batch.trace["post_start"] = float(self.env.now)
+        yield from self.host_service("post", batch.post_ticks)
+        batch.trace["post_end"] = batch.trace["output_ready"] = float(self.env.now)
+        self.publish(batch.trace, batch.items)
+
+    def observed_phase_ticks(self, totals, running):
+        result = dict(totals)
+        if running is not None:
+            phase, started = running
+            result[phase] = result.get(phase, 0.0) + (self.env.now - started)
+        return result
+
+    def batch_workload(self, stage, items, candidate_queues, layer=None):
         """Count selected source-row spans, without materializing activation tensors.
 
         Forward payload rows are ordered by expert. Return payloads contain
@@ -389,24 +508,28 @@ class GPUWorker:
         fragments = 0
         for rows in by_buffer.values():
             fragments += sum(row - 1 not in rows for row in rows)
-        contiguous = (stage == "expert" and fragments == 1
+        pipeline = self.sim.overhead_model.preset == "pipeline"
+        reduce_topk = stage != "expert" and self.sim.top_k > 1 and layer is not None and layer > 0
+        passthrough = stage == "expert" or (pipeline and not reduce_topk)
+        contiguous = (passthrough and fragments == 1
                       and all(refs[i] == (refs[0][0], refs[0][1] + i)
                               for i in range(len(refs))))
         return BatchWorkload(input_rows=len(refs), fragments=fragments,
                              candidate_queues=candidate_queues,
                              hidden_dim=self.sim.hidden_dim,
                              bytes_per_element=self.sim.bytes_per_element,
-                             contiguous=contiguous)
+                             contiguous=contiguous, reduce_topk=reduce_topk if pipeline else None)
 
-    def batch_service(self, stage, duration, batch_size, *, items=None, candidate_queues=1):
+    def batch_service(self, stage, duration, batch_size, *, items=None, candidate_queues=1, layer=None):
         model = getattr(self.sim, "overhead_model", None)
         if model is None or not model.enabled:
             return BatchOverheadEstimate(duration)
         workload = None
-        if model.preset == "structural" and stage != "finalize" and batch_size:
-            workload = self.batch_workload(stage, items, candidate_queues)
+        structural = model.preset == "structural" and stage != "finalize"
+        if (structural or model.preset == "pipeline") and batch_size:
+            workload = self.batch_workload(stage, items, candidate_queues, layer)
         estimate = model.evaluate(stage, duration, batch_size=batch_size, workload=workload)
-        if stage != "finalize" and batch_size:
+        if (stage != "finalize" or model.preset == "pipeline") and batch_size:
             self.overhead_batch_counts[stage] += 1
             for name, value in estimate.as_dict().items():
                 self.overhead_scheduled_ticks[stage][name] += value
@@ -425,7 +548,7 @@ class GPUWorker:
         result = {"batch_counts": dict(self.overhead_batch_counts),
                   "by_stage_ticks": {stage: dict(values) for stage, values
                                      in self.overhead_scheduled_ticks.items()}}
-        if self.sim.overhead_model.preset == "structural":
+        if self.sim.overhead_model.preset in ("structural", "pipeline"):
             result["by_stage_workload"] = {stage: dict(values) for stage, values
                                           in self.overhead_workload_counts.items()}
         return result
@@ -435,9 +558,10 @@ class GPUWorker:
         if model is not None and model.enabled:
             # start/end retain the complete reserved batch service interval.
             trace["batch_overhead"] = service.as_dict()
-            trace["gpu_start"] = trace["start"] + service.cpu_exposed_ticks
-            trace["compute_start"] = trace["gpu_start"] + service.reformation_exposed_ticks
-            trace["compute_end"] = trace["end"]
+            if model.preset != "pipeline":
+                trace["gpu_start"] = trace["start"] + service.cpu_exposed_ticks
+                trace["compute_start"] = trace["gpu_start"] + service.reformation_exposed_ticks
+                trace["compute_end"] = trace["end"]
             if service.details is not None:
                 trace["batch_workload"] = service.details["workload"]
                 trace["batch_overhead_components"] = service.details["components"]
@@ -481,7 +605,9 @@ class AsyncMoESimulator:
             **(getattr(self, "overhead_config", None) or {}))
         self.hidden_dim = getattr(self, "hidden_dim", 2048)
         self.bytes_per_element = getattr(self, "bytes_per_element", 2)
-        self.track_fragments = self.overhead_model.preset == "structural"
+        self.track_fragments = self.overhead_model.preset in ("structural", "pipeline")
+        if self.overhead_model.preset == "pipeline" and getattr(self, "execution_mode", "async") != "async":
+            raise ValueError("pipeline overhead requires async execution")
         self.next_buffer_id = 0
         self.next_output_batch_id = 0
         self.expert_scheduling = getattr(self, "expert_scheduling", "layer")
@@ -850,6 +976,11 @@ class AsyncMoESimulator:
                 "hardware_calibrated": False,
             },
         }
+        if self.overhead_model.preset == "pipeline":
+            result["host_busy_ticks_by_phase"] = [
+                worker.observed_phase_ticks(worker.host_phase_ticks, worker.host_phase) for worker in self.workers]
+            result["gpu_busy_ticks_by_phase"] = [
+                worker.observed_phase_ticks(worker.gpu_phase_ticks, worker.gpu_phase) for worker in self.workers]
         if self.queue_trace is not None:
             result["queue_trace"] = self.queue_trace.finish(makespan)
         if self.observer is not None:
@@ -944,6 +1075,8 @@ def run_simulation(
     # Reject invalid cost assumptions before loading profiles or opening files.
     overhead_config = BatchOverheadModel(
         ticks_per_millisecond=ticks_per_millisecond, **(overhead_config or {})).config()
+    if overhead_config["preset"] == "pipeline" and execution_mode != "async":
+        raise ValueError("pipeline overhead requires async execution")
     if expert_scheduling not in ("layer", "expert"):
         raise ValueError("expert_scheduling must be 'layer' or 'expert'")
     # Validate policy before loading potentially large profiles.

@@ -193,7 +193,12 @@ class QueueTraceRecorder:
         overhead_enabled = self.configuration.get("batch_overhead_model", {}).get("enabled", False)
         decision_window = "positive-duration scheduled compute intersects [requested start, requested end), or zero-duration decision starts inside it; carry-in intervals retained; end is scheduled completion, possibly beyond observed coverage"
         queue_definition = self.configuration.get("queue_definition", "ready, waiting work only; excludes executing work, network transfers, and incomplete joins")
-        if overhead_enabled:
+        if self.configuration.get("batch_overhead_model", {}).get("preset") == "pipeline":
+            decision_window = ("reservation to GPU completion intersects the window; adjacent host reservations may "
+                               "overlap. gather_start/end and compute_start/end are FIFO GPU segments in ticks; "
+                               "CPU prelaunch may leave a gap between them. CPU post and output publication follow.")
+            queue_definition += "; selected rows leave their ready queue at host reservation"
+        elif overhead_enabled:
             decision_window = "positive-duration reserved batch service (exposed CPU gap, GPU reformation, base compute) intersects [requested start, requested end), or zero-duration decision starts inside it; carry-in intervals retained; gpu_start/compute_start delimit GPU/base compute in ticks; end is scheduled completion, possibly beyond observed coverage"
             queue_definition += "; selected batches leave the ready queue when reserved, including during exposed CPU scheduling before GPU execution"
         metadata = {

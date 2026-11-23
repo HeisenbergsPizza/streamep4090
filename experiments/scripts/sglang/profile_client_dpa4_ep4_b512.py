@@ -115,7 +115,7 @@ def graph_disabled_from_env():
     return value == "1"
 
 
-def validate_server(info, *, disable_cuda_graph=False):
+def validate_server(info, *, disable_cuda_graph=False, require_worker_cap=True):
     expected = {
         "tp_size": 4, "dp_size": 4, "ep_size": 4, "moe_dp_size": 1,
         "attn_cp_size": 1, "enable_dp_attention": True,
@@ -133,11 +133,15 @@ def validate_server(info, *, disable_cuda_graph=False):
                 "且两端的 SGLANG_DISABLE_CUDA_GRAPH 设置一致。"
             )
     states = info.get("internal_states", [])
+    if not require_worker_cap and not states:
+        return
     if len(states) != 4:
         raise RuntimeError(f"预期 4 个 DP worker 状态，实际为 {len(states)}")
     # Response order is not DP-rank order. Check every worker independently.
     for state in states:
         cap = state.get("effective_max_running_requests_per_dp")
+        if not require_worker_cap and cap is None:
+            continue
         if cap != BATCH_SIZE // 4:
             raise RuntimeError(f"某个 DP worker 实际请求上限为 {cap}，预期 128")
 

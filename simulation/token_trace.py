@@ -92,6 +92,8 @@ class TokenTraceRecorder:
             "actual_gpu_start_ms": None, "actual_completion_ms": None,
         }
         members = [item.token.tid if stage == "expert" else item.tid for item, _ in items]
+        if "host_only_finalize" in trace:
+            batch["host_only_finalize"] = trace["host_only_finalize"]
         batch_record = dict(batch, token_ids=members,
                             expert_ids=([item.expert_id for item, _ in items] if stage == "expert" else None),
                             source_cohort=source)
@@ -207,7 +209,7 @@ class TokenTraceRecorder:
             record["join_ready_ms"] = self._ms(now_ticks)
 
     def _make_metadata(self, status, fully_drained, pending, pending_batches, reason=None):
-        return {
+        metadata = {
             "format": "streaminfer.token_trace", "version": 1, "time_unit": "ms",
             "paths": self.paths, "status": status, "complete": status == "complete",
             "fully_drained": fully_drained, "simulation_end_ms": self._ms(self.last_ticks),
@@ -222,6 +224,13 @@ class TokenTraceRecorder:
             "batch_membership": "batches file contains all members of each relevant source/expert/next-attention batch, including untracked tokens; expert token_ids may repeat for distinct expert_ids; IDs are recorder-local global selection ordinals, independent of output_batch_id",
             "censoring": "unfinished token-layers/batches are emitted with status=censored on early stop or exception; complete=true requires a fully drained simulation and no pending observations",
         }
+        if self.configuration.get("batch_overhead_model", {}).get("preset") == "pipeline":
+            metadata["time_semantics"] = (
+                "selection_ms freezes membership on the host. GPU gather and compute use separate FIFO segments, "
+                "with a possible gap before compute_start_ms. actual_completion_ms is GPU completion; host post "
+                "and publication can follow later. For host_only_finalize the zero-duration GPU markers denote "
+                "logical completion on the host and contribute no GPU busy time.")
+        return metadata
 
     def _write_metadata(self, metadata):
         Path(self.paths["metadata"]).write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n",

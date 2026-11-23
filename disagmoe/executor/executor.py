@@ -36,6 +36,7 @@ from disagmoe.ops.cuda_graph import copy_graph_results_cuda
 from disagmoe.frontend.datatypes import BatchMetadata
 from disagmoe.utils.gdr_context import use_gdrcopy_optimization, GdrDoubleBuffer
 from disagmoe.utils.runtime_checks import kv_cache_block_budget
+from disagmoe.utils.shared_top8_replay import SharedTop8Replay
 
 def get_module_param_memory(module, unit='GB'):
     unit_scale = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}
@@ -95,6 +96,14 @@ class AttnExecutor(Executor):
         self.block_mgr: BaseBlockManager = None
         self.gate_profile_bytes: Optional[bytes] = gate_profile_bytes
         self.has_profile_gating = gate_profile_bytes is not None and len(gate_profile_bytes) > 0
+        self.shared_top8 = None
+        if path := ENV_VARS.get("STREAMEP_SHARED_TOP8"):
+            if self.has_profile_gating or ENV_VARS.get("DMOE_WEIGHTED_ROUTER_FILE"):
+                raise ValueError("Select only one synthetic router")
+            self.shared_top8 = SharedTop8Replay(
+                path, int(ENV_VARS["STREAMEP_SHARED_TOP8_PROMPT_LEN"]),
+                ENV_VARS.get("STREAMEP_SHARED_TOP8_AUDIT_DIR"))
+            self.has_profile_gating = True
         path = getattr(model_config, "checkpoint_path", None)
         self.checkpoint = QwenCheckpoint(path, model_config) if path else None
         if self.checkpoint and (self.has_profile_gating or self.enable_cuda_graph
@@ -156,6 +165,8 @@ class AttnExecutor(Executor):
                 cache_config=self.vllm_cache_config,
                 quant_config_qkv=qkv_quant_config,
                 gate_profile_bytes=self.gate_profile_bytes,
+                shared_top8_table=(self.shared_top8.layer_table(layer_id, self.device)
+                                   if self.shared_top8 else None),
                 num_shared_experts=getattr(self.model_config, "num_shared_experts", 0),
                 shared_expert_intermediate_size=getattr(self.model_config, "shared_expert_intermediate_size", None),
                 quant_config_shared=shared_quant_config,
@@ -290,7 +301,7 @@ class AttnExecutor(Executor):
             hidden_states = torch.randn((batch_size, self.model_config.hidden_size), dtype=self.model_config.dtype)
             operator = self.operators[layer_id]
             # Use dummy request IDs to satisfy profile-driven gating during profiling.
-            dummy_request_ids = torch.arange(batch_size, dtype=torch.int64, device=self.device) if self.has_profile_gating else None
+            dummy_request_ids = self.dummy_routing_inputs(batch_size)
             operator.forward(positions, hidden_states, kv_cache, attn_metadata, request_ids=dummy_request_ids)
             
     def determine_kv_cache_blocks(self) -> int:
@@ -338,7 +349,8 @@ class AttnExecutor(Executor):
             # get_logger().info(f"Attention warmup layer {layer_id} start")
             for _ in range(2):
                 # Pass batch.req_ids so profile-driven gating receives request IDs.
-                self.execute_eager(layer_id, batch.seq_lens_tensor.to(torch.long), batch.data, meta, request_ids=batch.req_ids)
+                self.execute_eager(layer_id, batch.seq_lens_tensor.to(torch.long), batch.data, meta,
+                                   request_ids=self.dummy_routing_inputs(batch_size))
             # get_logger().info(f"Attention warmup layer {layer_id} done")
                 
         get_logger().info("Attention warmup done")
@@ -364,7 +376,8 @@ class AttnExecutor(Executor):
         )
     
     def execute_normal(self, batch: AttentionForwardBatch) -> AttentionForwardResult:
-        result = self.execute_eager(batch.layer_id, batch.positions, batch.data, batch.metadata, request_ids=batch.req_ids)
+        result = self.execute_eager(batch.layer_id, batch.positions, batch.data, batch.metadata,
+                                    request_ids=self.routing_inputs(batch))
         outputs, topk_weights, topk_ids = result[:3]
         
         return AttentionForwardResult(
@@ -378,7 +391,7 @@ class AttnExecutor(Executor):
     def execute_graph(self, batch: AttentionForwardBatch) -> AttentionForwardResult:
         req_ids_tensor = None
         if self.has_profile_gating and batch.req_ids is not None:
-            req_ids_tensor = torch.tensor(batch.req_ids, dtype=torch.int64, device="cuda")
+            req_ids_tensor = torch.tensor(self.routing_inputs(batch), dtype=torch.int64, device="cuda")
         staging_outputs, staging_topk_weights, staging_topk_ids = self.cuda_graph_executor.run(batch.layer_id, batch.positions, batch.data, batch.metadata, request_ids=req_ids_tensor)
         outputs = torch.empty_like(staging_outputs)
         
@@ -405,6 +418,18 @@ class AttnExecutor(Executor):
             expert_ids=expert_ids,
             sync_event=None,
         )
+
+    def dummy_routing_inputs(self, size):
+        if not self.has_profile_gating:
+            return None
+        if self.shared_top8:
+            return torch.zeros(size, dtype=torch.int64, device="cuda")
+        return torch.arange(size, dtype=torch.int64, device="cuda")
+
+    def routing_inputs(self, batch):
+        if self.shared_top8:
+            return self.shared_top8.row_indices(batch.req_ids, batch.metadata.seq_lens)
+        return batch.req_ids
 
     @nvtx_range("AttnExecutor.execute")
     def execute(self, batch: AttentionForwardBatch) -> AttentionForwardResult:
@@ -618,6 +643,9 @@ class ParallelAttnExecutor(AttnExecutor):
         self.cache_config = cache_config
         self.gate_profile_bytes: Optional[bytes] = gate_profile_bytes
         self.has_profile_gating = gate_profile_bytes is not None and len(gate_profile_bytes) > 0
+        self.shared_top8 = None
+        if ENV_VARS.get("STREAMEP_SHARED_TOP8"):
+            raise ValueError("Shared Top-8 replay requires attention TP=1")
         # Build quantization config for attention QKV if requested
         qkv_quant_config = None
         try:

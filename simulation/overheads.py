@@ -1,4 +1,4 @@
-"""Configurable *assumed exposed* batch costs, not a CPU/GPU pipeline model.
+"""Batch service demands for the fixed-exposure and host/GPU pipeline models.
 
 Table 4 reports Schedule separately from Prepare/Launch/Post-process. Only
 Schedule is used here. The paper does NOT report a GPU reformation cost; its
@@ -24,6 +24,15 @@ STRUCTURAL_DEFAULTS = {
     "reformation_bandwidth_gb_s": 500.0,
     "reformation_per_fragment_us": 0.05,
     "reformation_scale": 1.0,
+}
+# Per-batch microseconds. Zero leaves an uncalibrated phase out of the
+# sensitivity study. Dequeue and reformation inherit STRUCTURAL_DEFAULTS.
+PIPELINE_DEFAULTS = {
+    "cpu_pre_attention_us": 0.0, "cpu_pre_expert_us": 0.0,
+    "cpu_post_attention_us": 0.0, "cpu_post_expert_us": 0.0,
+    "cpu_launch_us": 0.0, "cpu_finalize_us": 0.0,
+    "cpu_gather_tail_us": 0.0, "cpu_reduce_tail_us": 0.0,
+    "cpu_pre_per_row_us": 0.0, "cpu_post_per_row_us": 0.0,
 }
 
 
@@ -64,6 +73,7 @@ class BatchWorkload:
     hidden_dim: int
     bytes_per_element: int
     contiguous: bool = False
+    reduce_topk: bool | None = None
 
     def __post_init__(self):
         for name in ("input_rows", "fragments", "candidate_queues", "hidden_dim", "bytes_per_element"):
@@ -74,6 +84,8 @@ class BatchWorkload:
             raise ValueError("workload hidden_dim and bytes_per_element must be positive")
         if not isinstance(self.contiguous, bool):
             raise ValueError("workload contiguous must be a bool")
+        if self.reduce_topk is not None and not isinstance(self.reduce_topk, bool):
+            raise ValueError("workload reduce_topk must be a bool or None")
 
 
 @dataclass(frozen=True)
@@ -107,6 +119,38 @@ class BatchOverheadEstimate:
         }
 
 
+@dataclass(frozen=True)
+class PipelineOverheadEstimate:
+    """Independent service demands. Exposure depends on the event timeline."""
+    base_compute_ticks: float
+    cpu_dequeue_ticks: float = 0.0
+    cpu_prelaunch_ticks: float = 0.0
+    cpu_post_ticks: float = 0.0
+    reformation_raw_ticks: float = 0.0
+    details: dict | None = None
+
+    @property
+    def cpu_raw_ticks(self):
+        return self.cpu_dequeue_ticks + self.cpu_prelaunch_ticks + self.cpu_post_ticks
+
+    @property
+    def gpu_ticks(self):
+        return self.reformation_raw_ticks + self.base_compute_ticks
+
+    @property
+    def total_ticks(self):
+        # Sum of resource service demands, possibly overlapping in wall time.
+        return self.cpu_raw_ticks + self.gpu_ticks
+
+    def as_dict(self):
+        return {
+            "base_compute_ticks": self.base_compute_ticks, "gpu_ticks": self.gpu_ticks,
+            "cpu_dequeue_ticks": self.cpu_dequeue_ticks, "cpu_prelaunch_ticks": self.cpu_prelaunch_ticks,
+            "cpu_post_ticks": self.cpu_post_ticks, "cpu_raw_ticks": self.cpu_raw_ticks,
+            "reformation_raw_ticks": self.reformation_raw_ticks, "resource_service_ticks": self.total_ticks,
+        }
+
+
 class BatchOverheadModel:
     def __init__(self, *, ticks_per_millisecond=10, preset="none",
                  cpu_schedule_scale=1.0, cpu_schedule_overlap=None,
@@ -114,9 +158,14 @@ class BatchOverheadModel:
                  cpu_fixed_us=None, cpu_per_row_us=None,
                  cpu_per_fragment_us=None, cpu_per_queue_us=None,
                  reformation_fixed_us=None, reformation_bandwidth_gb_s=None,
-                 reformation_per_fragment_us=None, reformation_scale=None):
-        if preset not in ("none", "paper", "structural"):
-            raise ValueError("overhead preset must be 'none', 'paper', or 'structural'")
+                 reformation_per_fragment_us=None, reformation_scale=None,
+                 cpu_pre_attention_us=None, cpu_pre_expert_us=None, cpu_launch_us=None,
+                 cpu_post_attention_us=None, cpu_post_expert_us=None, cpu_finalize_us=None,
+                 cpu_gather_tail_us=None, cpu_reduce_tail_us=None,
+                 cpu_pre_per_row_us=None, cpu_post_per_row_us=None,
+                 reduction_fixed_us=None, reduction_bandwidth_gb_s=None):
+        if preset not in ("none", "paper", "structural", "pipeline"):
+            raise ValueError("overhead preset must be 'none', 'paper', 'structural' or 'pipeline'")
         self.preset = preset
         self.enabled = preset != "none"
         self.ticks_per_ms = _nonnegative(ticks_per_millisecond, "ticks_per_millisecond")
@@ -144,22 +193,43 @@ class BatchOverheadModel:
             "reformation_per_fragment_us": reformation_per_fragment_us,
             "reformation_scale": reformation_scale,
         }
-        if preset != "structural" and any(value is not None for value in coefficients.values()):
-            raise ValueError("structural coefficients require --overhead-model structural")
-        if preset == "structural":
+        if preset not in ("structural", "pipeline") and any(value is not None for value in coefficients.values()):
+            raise ValueError("structural coefficients require --overhead-model structural or pipeline")
+        if preset in ("structural", "pipeline"):
             if self.reformation_compute_ratio != 0:
                 raise ValueError("structural reformation uses bytes/fragments; reformation_compute_ratio must be zero")
             for name, value in coefficients.items():
                 setattr(self, name, _nonnegative(STRUCTURAL_DEFAULTS[name] if value is None else value, name))
             if self.reformation_bandwidth_gb_s == 0:
                 raise ValueError("reformation_bandwidth_gb_s must be positive")
+        phases = dict(cpu_pre_attention_us=cpu_pre_attention_us, cpu_pre_expert_us=cpu_pre_expert_us,
+                      cpu_post_attention_us=cpu_post_attention_us, cpu_post_expert_us=cpu_post_expert_us,
+                      cpu_launch_us=cpu_launch_us, cpu_finalize_us=cpu_finalize_us,
+                      cpu_gather_tail_us=cpu_gather_tail_us, cpu_reduce_tail_us=cpu_reduce_tail_us,
+                      cpu_pre_per_row_us=cpu_pre_per_row_us, cpu_post_per_row_us=cpu_post_per_row_us)
+        if preset == "pipeline":
+            if self.cpu_schedule_overlap is not None or self.reformation_overlap:
+                raise ValueError("pipeline derives overlap from CPU and GPU events; omit fixed overlap overrides")
+            for name, value in phases.items():
+                setattr(self, name, _nonnegative(PIPELINE_DEFAULTS[name] if value is None else value, name))
+            self.reduction_fixed_us = (self.reformation_fixed_us if reduction_fixed_us is None
+                                       else _nonnegative(reduction_fixed_us, "reduction_fixed_us"))
+            self.reduction_bandwidth_gb_s = (self.reformation_bandwidth_gb_s if reduction_bandwidth_gb_s is None
+                                             else _nonnegative(reduction_bandwidth_gb_s, "reduction_bandwidth_gb_s"))
+            if self.reduction_bandwidth_gb_s == 0:
+                raise ValueError("reduction_bandwidth_gb_s must be positive")
+        elif any(value is not None for value in (*phases.values(), reduction_fixed_us, reduction_bandwidth_gb_s)):
+            raise ValueError("host phase coefficients require --overhead-model pipeline")
 
     def config(self):
         result = {name: getattr(self, name) for name in (
             "preset", "cpu_schedule_scale", "cpu_schedule_overlap",
             "reformation_compute_ratio", "reformation_overlap")}
-        if self.preset == "structural":
+        if self.preset in ("structural", "pipeline"):
             result.update({name: getattr(self, name) for name in STRUCTURAL_DEFAULTS})
+        if self.preset == "pipeline":
+            result.update({name: getattr(self, name) for name in PIPELINE_DEFAULTS})
+            result.update(reduction_fixed_us=self.reduction_fixed_us, reduction_bandwidth_gb_s=self.reduction_bandwidth_gb_s)
         return result
 
     def evaluate(self, stage, compute_ticks, batch_size=1, workload=None):
@@ -168,9 +238,11 @@ class BatchOverheadModel:
         compute_ticks = _nonnegative(compute_ticks, "compute_ticks")
         if isinstance(batch_size, bool) or not isinstance(batch_size, Integral) or batch_size < 0:
             raise ValueError("batch_size must be a nonnegative integer")
-        if not self.enabled or stage == "finalize" or batch_size == 0:
+        if self.preset == "pipeline" and batch_size == 0:
+            return PipelineOverheadEstimate(compute_ticks)
+        if not self.enabled or (stage == "finalize" and self.preset != "pipeline") or batch_size == 0:
             return BatchOverheadEstimate(compute_ticks)
-        if self.preset == "structural":
+        if self.preset in ("structural", "pipeline"):
             return self._evaluate_structural(stage, compute_ticks, batch_size, workload)
         hidden = (PAPER_SCHEDULE_HIDDEN[stage] if self.cpu_schedule_overlap is None
                   else self.cpu_schedule_overlap)
@@ -200,6 +272,12 @@ class BatchOverheadModel:
         output_bytes = int(batch_size) * int(workload.hidden_dim) * int(workload.bytes_per_element)
         traffic_bytes = input_bytes + output_bytes
         fastpath = stage == "expert" and workload.contiguous
+        fixed, bandwidth = self.reformation_fixed_us, self.reformation_bandwidth_gb_s
+        if self.preset == "pipeline":
+            reduction = stage != "expert" if workload.reduce_topk is None else workload.reduce_topk
+            fastpath = workload.contiguous and not reduction
+            if reduction:
+                fixed, bandwidth = self.reduction_fixed_us, self.reduction_bandwidth_gb_s
         try:
             cpu_parts = {
                 "fixed": self.cpu_fixed_us,
@@ -208,8 +286,8 @@ class BatchOverheadModel:
                 "candidate_queues": self.cpu_per_queue_us * workload.candidate_queues,
             }
             reform_parts = {
-                "fixed": 0.0 if fastpath else self.reformation_fixed_us,
-                "bytes": 0.0 if fastpath else traffic_bytes / self.reformation_bandwidth_gb_s / 1000,
+                "fixed": 0.0 if fastpath else fixed,
+                "bytes": 0.0 if fastpath else traffic_bytes / bandwidth / 1000,
                 "fragments": 0.0 if fastpath else self.reformation_per_fragment_us * workload.fragments,
             }
             cpu_us = sum(cpu_parts.values()) * self.cpu_schedule_scale
@@ -219,41 +297,72 @@ class BatchOverheadModel:
             reform = reform_us / 1000 * self.ticks_per_ms
         except OverflowError as exc:
             raise ValueError("batch overhead estimate must be finite") from exc
-        estimate = BatchOverheadEstimate(
-            compute_ticks, cpu, cpu * (1 - self.cpu_schedule_overlap),
-            reform, reform * (1 - self.reformation_overlap),
-            details={
-                "workload": {
-                    **{name: int(getattr(workload, name)) for name in (
-                        "input_rows", "fragments", "candidate_queues", "hidden_dim", "bytes_per_element")},
-                    "contiguous": workload.contiguous,
-                    "read_bytes": input_bytes,
-                    "write_bytes": output_bytes,
-                    "traffic_bytes": traffic_bytes,
-                },
-                "components": {
-                    "cpu_fixed_us": cpu_parts["fixed"],
-                    "cpu_rows_us": cpu_parts["rows"],
-                    "cpu_fragments_us": cpu_parts["fragments"],
-                    "cpu_queues_us": cpu_parts["candidate_queues"],
-                    "cpu_unscaled_us": sum(cpu_parts.values()),
-                    "cpu_schedule_scale": self.cpu_schedule_scale,
-                    "cpu_raw_us": cpu_us,
-                    "reformation_fixed_us": reform_parts["fixed"],
-                    "reformation_bytes_us": reform_parts["bytes"],
-                    "reformation_fragments_us": reform_parts["fragments"],
-                    "reformation_unscaled_us": reform_unscaled_us,
-                    "reformation_scale": self.reformation_scale,
-                    "reformation_raw_us": reform_us,
-                    "fast_path": fastpath,
-                    "executed_traffic_bytes": 0 if fastpath or self.reformation_scale == 0 else traffic_bytes,
-                },
-            })
+        details = {
+            "workload": {
+                **{name: int(getattr(workload, name)) for name in (
+                    "input_rows", "fragments", "candidate_queues", "hidden_dim", "bytes_per_element")},
+                "contiguous": workload.contiguous,
+                "read_bytes": input_bytes,
+                "write_bytes": output_bytes,
+                "traffic_bytes": traffic_bytes,
+            },
+            "components": {
+                "cpu_fixed_us": cpu_parts["fixed"],
+                "cpu_rows_us": cpu_parts["rows"],
+                "cpu_fragments_us": cpu_parts["fragments"],
+                "cpu_queues_us": cpu_parts["candidate_queues"],
+                "cpu_unscaled_us": sum(cpu_parts.values()),
+                "cpu_schedule_scale": self.cpu_schedule_scale,
+                "cpu_raw_us": cpu_us,
+                "reformation_fixed_us": reform_parts["fixed"],
+                "reformation_bytes_us": reform_parts["bytes"],
+                "reformation_fragments_us": reform_parts["fragments"],
+                "reformation_unscaled_us": reform_unscaled_us,
+                "reformation_scale": self.reformation_scale,
+                "reformation_raw_us": reform_us,
+                "fast_path": fastpath,
+                "executed_traffic_bytes": 0 if fastpath or self.reformation_scale == 0 else traffic_bytes,
+            },
+        }
+        if self.preset == "pipeline":
+            if stage == "finalize":
+                prepare_us, launch_us, post_us = self.cpu_finalize_us, 0.0, 0.0
+            else:
+                prepare_us = getattr(self, f"cpu_pre_{stage}_us") + self.cpu_pre_per_row_us * batch_size
+                launch_us = self.cpu_launch_us
+                post_us = getattr(self, f"cpu_post_{stage}_us") + self.cpu_post_per_row_us * batch_size
+            parts = details["components"]
+            parts["cpu_dequeue_us"] = cpu_us
+            tail_us = 0 if fastpath else (self.cpu_reduce_tail_us if reduction else self.cpu_gather_tail_us)
+            parts.update(reformation_kind="bypass" if fastpath else ("gather_and_sum" if reduction else "gather"),
+                         cpu_gather_tail_us=tail_us, cpu_prepare_us=prepare_us,
+                         cpu_launch_us=launch_us, cpu_post_us=post_us,
+                         cpu_raw_us=cpu_us + tail_us + prepare_us + launch_us + post_us)
+            prelaunch = (tail_us + prepare_us + launch_us) / 1000 * self.ticks_per_ms
+            estimate = PipelineOverheadEstimate(compute_ticks, cpu, prelaunch,
+                                                post_us / 1000 * self.ticks_per_ms, reform, details)
+        else:
+            estimate = BatchOverheadEstimate(compute_ticks, cpu, cpu * (1 - self.cpu_schedule_overlap),
+                                              reform, reform * (1 - self.reformation_overlap), details)
         if not all(math.isfinite(value) for value in estimate.as_dict().values()):
             raise ValueError("batch overhead estimate must be finite")
         return estimate
 
     def describe(self):
+        if self.preset == "pipeline":
+            return {
+                **self.config(), "enabled": True, "hardware_calibrated": False,
+                "model": "async_host_gpu_pipeline", "time_unit": "ticks", "ticks_per_millisecond": self.ticks_per_ms,
+                "host_resources": "one serial engine thread per rank; one previous batch retained through the next issue",
+                "host_costs_us": "dequeue = cpu_schedule_scale * (fixed + per_row*N + per_fragment*F + per_queue*Q); "
+                                 "after gather submission: gather tail + stage prepare + launch; retirement = stage post; finalize uses cpu_finalize_us",
+                "gpu_resources": "one FIFO compute stream per rank; gather is submitted after dequeue, compute after prelaunch",
+                "reformation_cost_us": "reformation_scale * (fixed + (N+B)*hidden_dim*bytes_per_element/(1000*bandwidth_GBps) + per_fragment*F); separate reduction fixed/bandwidth; contiguous ordinary merge bypasses gather",
+                "transport": "independent existing dispatch/return events; received work and full Top-K joins determine eligibility",
+                "charge_scope": "successful nonempty batches; empty polling, OS preemption and lock contention have no explicit service charge",
+                "cost_provenance": "structural coefficients are assumptions; added host phase defaults are zero pending measurement",
+                "accounting": "raw demand per resource; their sum can exceed elapsed time. GPU busy excludes host work and stream gaps",
+            }
         if self.preset == "structural":
             return {
                 **self.config(), "enabled": True, "hardware_calibrated": False,
@@ -310,8 +419,8 @@ class BatchOverheadModel:
 
 def add_overhead_arguments(parser):
     group = parser.add_argument_group("assumed CPU scheduling and GPU batch reformation")
-    group.add_argument("--overhead-model", choices=("none", "paper", "structural"), default="none",
-                       help="paper: Table 4 Schedule + assumed compute ratio; structural: assumed rows/fragments/bytes costs; default off")
+    group.add_argument("--overhead-model", choices=("none", "paper", "structural", "pipeline"), default="none",
+                       help="paper: fixed exposure; structural: row/fragment costs; pipeline: asynchronous engine host/stream timing")
     group.add_argument("--cpu-schedule-scale", type=float, default=1.0)
     group.add_argument("--cpu-schedule-overlap", type=float, default=None,
                        help="override hidden fraction [0,1] for both stages; paper defaults A=.506/E=.683, structural 0")
@@ -323,7 +432,13 @@ def add_overhead_arguments(parser):
         unit = ("GB/s (decimal bytes)" if name == "reformation_bandwidth_gb_s" else
                 "(dimensionless)" if name == "reformation_scale" else "us")
         group.add_argument("--" + name.replace("_", "-"), type=float, default=None,
-                           help=f"structural preset only; assumed default {default:g} {unit}")
+                           help=f"structural/pipeline preset; assumed default {default:g} {unit}")
+    for name in PIPELINE_DEFAULTS:
+        unit = "output row" if "per_row" in name else "local batch"
+        group.add_argument("--" + name.replace("_", "-"), type=float, default=None,
+                           help=f"pipeline host service in microseconds per {unit} (default 0 pending calibration)")
+    group.add_argument("--reduction-fixed-us", type=float, help="pipeline gather-and-sum intercept (default: gather intercept)")
+    group.add_argument("--reduction-bandwidth-gb-s", type=float, help="pipeline gather-and-sum effective GB/s (default: gather bandwidth)")
 
 
 def overhead_config_from_args(args):
@@ -334,5 +449,6 @@ def overhead_config_from_args(args):
         reformation_compute_ratio=getattr(args, "reformation_compute_ratio", None),
         reformation_overlap=getattr(args, "reformation_overlap", 0.0),
         ticks_per_millisecond=getattr(args, "ticks_per_ms", 10),
-        **{name: getattr(args, name, None) for name in STRUCTURAL_DEFAULTS},
+        **{name: getattr(args, name, None) for name in
+           (*STRUCTURAL_DEFAULTS, *PIPELINE_DEFAULTS, "reduction_fixed_us", "reduction_bandwidth_gb_s")},
     ).config()

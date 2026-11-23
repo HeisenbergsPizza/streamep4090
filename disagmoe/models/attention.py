@@ -101,9 +101,11 @@ class MoEAttention(nn.Module):
         quant_config_shared: Optional[QuantizationConfig] = None,
         intermediate_size: Optional[int] = None,
         qwen_norm_eps: Optional[float] = None,
+        shared_top8_table: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        self.shared_top8_table = shared_top8_table
         self.hidden_size = hidden_size
         self.head_dim = head_dim
         self.total_num_heads = num_heads
@@ -269,7 +271,12 @@ class MoEAttention(nn.Module):
 
         router_logits, _ = self.gate(output)
         
-        if self.profile_driven_router is not None:
+        if self.shared_top8_table is not None:
+            # request_ids holds per-token trace row indices for this router;
+            # graph replay refreshes those inputs before each launch.
+            topk_ids = self.shared_top8_table.index_select(0, request_ids).int()
+            topk_weights = torch.full_like(topk_ids, 1.0 / self.top_k, dtype=torch.float32)
+        elif self.profile_driven_router is not None:
             assert request_ids is not None, "Profile-driven routing requires request_ids"
             topk_weights, topk_ids = self.profile_driven_router.route(
                 request_ids=request_ids,

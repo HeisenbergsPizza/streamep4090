@@ -1148,6 +1148,8 @@ def run_simulation(
 ):
     overhead_model = BatchOverheadModel(ticks_per_millisecond=ticks_per_millisecond,
                                        **(overhead_config or {}))
+    if overhead_model.preset == "pipeline":
+        raise ValueError("pipeline models the asynchronous worker; choose --mode async")
     if overhead_model.preset == "structural":
         raise ValueError("structural overhead needs buffer provenance; use "
                          "sim_async.run_simulation(execution_mode='tbo') or simulation.steady_experiment")

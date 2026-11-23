@@ -20,6 +20,9 @@ _env_vars = {
     "ENABLE_NVTX": "0",
     "DMOE_ENABLE_NVTX": "0",
     "DMOE_WEIGHTED_ROUTER_FILE": "",
+    "STREAMEP_SHARED_TOP8": "",
+    "STREAMEP_SHARED_TOP8_PROMPT_LEN": "",
+    "STREAMEP_SHARED_TOP8_AUDIT_DIR": "",
     "VLLM_FLASH_ATTN_VERSION": "",
     "TMPDIR": "/tmp/disagmoe/",
 }

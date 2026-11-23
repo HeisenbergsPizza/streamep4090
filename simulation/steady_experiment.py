@@ -17,6 +17,7 @@ import re
 import time
 
 from .overheads import BatchOverheadModel, add_overhead_arguments, overhead_config_from_args
+from .profiling.bundle import add_bundle_input, parse_simulator_args
 
 
 RUNTIME_REFERENCE_PATH = (Path(__file__).resolve().parents[1]
@@ -124,7 +125,8 @@ def build_parser():
     defaults = load_runtime_reference()["parameters"]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--routing-profile", required=True, type=Path)
-    parser.add_argument("--expert-profile", required=True, type=Path)
+    add_bundle_input(parser, required=True)
+    parser.add_argument("--grouped-profile", type=Path, help="exact local expert count vectors")
     parser.add_argument("--attention-profile", type=Path,
                         help="pure-decode batch/context CSV in milliseconds; optional component column")
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -193,6 +195,8 @@ def run_case(args):
 
     mode = resolve_execution(args)
     overhead_config = overhead_config_from_args(args)
+    if overhead_config["preset"] == "pipeline" and mode != "async":
+        raise ValueError("pipeline models the asynchronous worker; choose --mode async")
     overhead_description = BatchOverheadModel(
         ticks_per_millisecond=args.ticks_per_ms, **overhead_config).describe()
     reference = load_runtime_reference()
@@ -258,7 +262,7 @@ def run_case(args):
                          attention_identity=attention_identity,
                          routing_pool_size=len(profile_ids), source_kind="bootstrap_existing_request_prefixes",
                          routing_replay="whole-request sampling with replacement; original token/layer/Top-k order; no token wrapping",
-                         hardware_calibrated=False, grouped_profile=None,
+                         hardware_calibrated=False, grouped_profile=file_identity(args.grouped_profile) if args.grouped_profile else None,
                          finalize_per_token_us=0, n_gpu_per_host=args.gpus,
                          first_arrival_ms=arrivals[0] if arrivals else None,
                          last_arrival_ms=arrivals[-1] if arrivals else None)
@@ -325,6 +329,7 @@ def run_case(args):
             max_attention_batch_size=args.attention_batch_cap, max_batch_size=args.expert_batch_cap,
             expert_profile_path=str(args.expert_profile), profile_routing_path=str(args.routing_profile),
             attention_profile_path=str(args.attention_profile) if args.attention_profile else None,
+            grouped_profile_path=str(args.grouped_profile) if args.grouped_profile else None,
             initial_context_length=args.initial_context, expert_cost_scale=args.expert_cost_scale,
             attn_service_t=args.attention_per_token_us / 1000 * args.ticks_per_ms,
             finalize_per_token_t=0, net_delay_fn=_network_delay(args), ticks_per_millisecond=args.ticks_per_ms,
@@ -358,7 +363,7 @@ def run_case(args):
 
 def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_simulator_args(parser, argv)
     try:
         run_case(args)
     except (ValueError, FileNotFoundError) as exc:

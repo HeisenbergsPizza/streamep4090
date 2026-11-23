@@ -126,6 +126,32 @@ class PlotSchedulerTraceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         execution_intervals(trace, 0)
 
+    def test_pipeline_intervals_leave_gather_to_compute_wait_blank(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "pipeline"
+            recorder = QueueTraceRecorder(
+                prefix, num_gpus=1, num_layers=1, ticks_per_millisecond=4,
+                interval_ms=1, policy="defrag", top_k=1,
+                configuration={"batch_overhead_model": {"preset": "pipeline", "enabled": True}})
+            recorder.capture_schedule(dict(gpu=0, stage="attention", layer=0,
+                                           start=1, end=16, gpu_start=3,
+                                           gather_start=3, gather_end=7,
+                                           compute_start=12, compute_end=16))
+            # The next reservation overlaps the first; its fast path skips gather.
+            recorder.capture_schedule(dict(gpu=0, stage="expert", layer=0,
+                                           start=13, end=20, gpu_start=17,
+                                           gather_start=None, gather_end=None,
+                                           compute_start=17, compute_end=20))
+            recorder.finish(20)
+            trace = load_trace(prefix.with_suffix(".npz"))
+            intervals = execution_intervals(trace, 0)
+            self.assertEqual(intervals["attention"], [(.75, 1.75, 0), (3., 4., 0)])
+            self.assertEqual(intervals["expert"], [(4.25, 5., 0)])
+            cropped = execution_intervals(crop_trace(trace, 1., 4.), 0)
+            self.assertEqual(cropped["attention"], [(1., 1.75, 0), (3., 4., 0)])
+            self.assertEqual(cropped["expert"], [])
+            self.assertEqual(execution_intervals(crop_trace(trace, 2., 3.), 0)["attention"], [])
+
     def test_default_comparison_uses_common_complete_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             one = load_trace(fixture(directory, "defrag"))

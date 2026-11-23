@@ -203,10 +203,44 @@ def _decision_path(trace):
     return path
 
 
+def _gpu_segments(record, metadata, start, end, pipeline, number):
+    pipeline = pipeline or "gather_start" in record or "gather_end" in record
+    if not pipeline and "gpu_start" not in record:
+        return [(start, end)]
+    ticks_per_ms = record.get("ticks_per_millisecond", metadata.get("ticks_per_millisecond"))
+    if (isinstance(ticks_per_ms, bool) or not isinstance(ticks_per_ms, (int, float))
+            or not math.isfinite(ticks_per_ms) or ticks_per_ms <= 0):
+        raise ValueError(f"invalid GPU time unit on line {number}")
+
+    def timestamp_ms(field):
+        value = record.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f"invalid {field} on line {number}")
+        return value / ticks_per_ms
+
+    if pipeline:
+        if "gather_start" not in record or "gather_end" not in record:
+            raise ValueError(f"missing pipeline gather bounds on line {number}")
+        segments = []
+        if record["gather_start"] is not None or record["gather_end"] is not None:
+            segments.append((timestamp_ms("gather_start"), timestamp_ms("gather_end")))
+        segments.append((timestamp_ms("compute_start"), timestamp_ms("compute_end")))
+    else:
+        # Older overhead presets have back-to-back reformation and compute.
+        segments = [(timestamp_ms("gpu_start"), end)]
+    previous = start
+    for lo, hi in segments:
+        if not previous <= lo <= hi <= end:
+            raise ValueError(f"overlapping GPU segments or interval outside batch service on line {number}")
+        previous = hi
+    return segments
+
+
 def execution_intervals(trace: QueueTrace, gpu: int):
-    """Clip GPU execution (including reformation), excluding exposed CPU gaps."""
+    """Clip GPU segments to the window; keep host-only and inter-segment waits blank."""
     first, last = trace.time_edges_ms[[0, -1]]
     intervals = {"attention": [], "expert": []}
+    pipeline = trace.metadata.get("simulation_config", {}).get("batch_overhead_model", {}).get("preset") == "pipeline"
     with gzip.open(_decision_path(trace), "rt", encoding="utf-8") as file:
         for number, line in enumerate(file, 1):
             if not line.strip():
@@ -222,29 +256,13 @@ def execution_intervals(trace: QueueTrace, gpu: int):
                     or not isinstance(start, (int, float)) or not isinstance(end, (int, float))
                     or not math.isfinite(start) or not math.isfinite(end) or end < start):
                 raise ValueError(f"invalid decision time on line {number}")
-            if "gpu_start" in record:
-                # Overhead-enabled start/end cover reserved batch service;
-                # gpu_start is in ticks, not milliseconds. Old traces retain
-                # their original start_ms semantics without this field.
-                gpu_start = record["gpu_start"]
-                ticks_per_ms = record.get("ticks_per_millisecond",
-                                          trace.metadata.get("ticks_per_millisecond"))
-                if (isinstance(gpu_start, bool) or isinstance(ticks_per_ms, bool)
-                        or not isinstance(gpu_start, (int, float))
-                        or not isinstance(ticks_per_ms, (int, float))
-                        or not math.isfinite(gpu_start) or not math.isfinite(ticks_per_ms)
-                        or ticks_per_ms <= 0):
-                    raise ValueError(f"invalid GPU start/unit on line {number}")
-                gpu_start_ms = gpu_start / ticks_per_ms
-                if not start <= gpu_start_ms <= end:
-                    raise ValueError(f"GPU interval outside batch service on line {number}")
-                start = gpu_start_ms
             layer = record.get("layer")
             if isinstance(layer, bool) or not isinstance(layer, int) or not 0 <= layer < trace.layers:
                 raise ValueError(f"invalid decision layer on line {number}")
-            lo, hi = max(float(first), start), min(float(last), end)
-            if hi > lo:
-                intervals[stage].append((lo, hi, layer))
+            for lo, hi in _gpu_segments(record, trace.metadata, start, end, pipeline, number):
+                lo, hi = max(float(first), lo), min(float(last), hi)
+                if hi > lo:
+                    intervals[stage].append((lo, hi, layer))
     return intervals
 
 
@@ -398,7 +416,7 @@ def render(traces, output_dir, gpu=0, title="Scheduler queues", expert_scale="no
                 "finalize_excluded_from_figures_and_active_layers": True,
                 "summary_semantics": "duration-weighted integrals over the selected window; all GPUs retained in CSV",
                 "active_layers_semantics": "time-integral of count(A_l > 0 OR E_l > 0), never count of positive bin means",
-                "execution_semantics": "recorded service intervals clipped to the window; finalize excluded; plotted at layer coordinates, not individual expert rows",
+                "execution_semantics": "GPU execution clipped to the window; pipeline traces show gather and compute separately with waits left blank; finalize excluded; plotted at layer coordinates",
                 "execution_coordinates": "layer",
                 "expert_identity_source": "expert_id in each expert-wise decision trace record; same-layer experts share a plot row",
                 "color_scale": "log1p time-mean ready depth; one shared scale per stage across policies",

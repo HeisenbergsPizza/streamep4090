@@ -1,5 +1,6 @@
 #include "layer.h"
 #include "batch.hpp"
+#include "worker_gap_trace.hpp"
 
 UnifiedLayer::UnifiedLayer(LayerType layer_type, int layer_id): 
     layer_type(layer_type), layer_id(layer_id), expert_id(-1), num_tokens(0) {}
@@ -142,12 +143,14 @@ TokenBatch UnifiedLayerSchedulerBase::get_batch_from_layer(int layer_id) {
     if (this->layer_uses_token_queue(layer_id)) {
         this->scheduler_mutex->lock();
         auto tokens = this->layers[layer_id]->get_all_tokens();
+        GapTracedDefragScheduler::queue_updated(this, layer_id, "dequeue");
         this->scheduler_mutex->unlock();
         auto batch = TokenBatch::pack_topk_tokens(layer_id, tokens);
         return batch;
     } else { 
         this->scheduler_mutex->lock();
         auto batches = this->layers[layer_id]->get_all_batches();
+        GapTracedDefragScheduler::queue_updated(this, layer_id, "dequeue");
         this->scheduler_mutex->unlock();
         auto batch = TokenBatch::merge(batches);
         return batch;
@@ -164,12 +167,14 @@ TokenBatch UnifiedLayerSchedulerBase::get_batch_from_layer_restricted(int layer_
     if (this->layer_uses_token_queue(layer_id)) {
         this->scheduler_mutex->lock();
         auto tokens = this->layers[layer_id]->get_tokens_restricted(token_threshold);
+        GapTracedDefragScheduler::queue_updated(this, layer_id, "dequeue");
         this->scheduler_mutex->unlock();
         auto batch = TokenBatch::pack_topk_tokens(layer_id, tokens);
         return batch;
     } else {
         this->scheduler_mutex->lock();
         auto batches = this->layers[layer_id]->get_batches_restricted(token_threshold);
+        GapTracedDefragScheduler::queue_updated(this, layer_id, "dequeue");
         this->scheduler_mutex->unlock();
         auto batch = TokenBatch::merge(batches);
         return batch;
@@ -195,14 +200,18 @@ void UnifiedLayerSchedulerBase::add_tokens_to_layer(int layer_id, int num_tokens
 void UnifiedLayerSchedulerBase::attn_add_tokens(int layer_id, const std::vector<TokenTopKInfo> &tokens) {
     std::lock_guard<std::mutex> lock(*this->scheduler_mutex);
     this->attn_layers[layer_id]->add_tokens(tokens);
+    GapTracedDefragScheduler::queue_updated(this, layer_id,
+        layer_id == num_attn_layers - 1 ? "top8_finalize" : "top8");
 }
 
 void UnifiedLayerSchedulerBase::add_batch(const TokenBatch &batch) {
     std::lock_guard<std::mutex> lock(*this->scheduler_mutex);
     if (batch.metadata->is_attention()) {
         this->attn_layers[batch.metadata->layer_id]->add_batch(batch);
+        GapTracedDefragScheduler::queue_updated(this, batch.metadata->layer_id, "attention_input");
     } else if (batch.metadata->is_expert()) {
         this->expert_layers[batch.metadata->layer_id]->add_batch(batch);
+        GapTracedDefragScheduler::queue_updated(this, num_attn_layers + batch.metadata->layer_id, "expert_input");
     } else {
         ASSERT_MSG(false, "Invalid batch metadata");
     }
@@ -212,8 +221,10 @@ void UnifiedLayerSchedulerBase::add_batch(const torch::Tensor& tensor, const bat
     std::lock_guard<std::mutex> lock(*this->scheduler_mutex);
     if (meta->is_attention()) {
         this->attn_layers[meta->layer_id]->add_batch(tensor, meta);
+        GapTracedDefragScheduler::queue_updated(this, meta->layer_id, "attention_input");
     } else if (meta->is_expert()) {
         this->expert_layers[meta->layer_id]->add_batch(tensor, meta);
+        GapTracedDefragScheduler::queue_updated(this, num_attn_layers + meta->layer_id, "expert_input");
     } else {
         ASSERT_MSG(false, "Invalid batch metadata");
     }
@@ -398,6 +409,9 @@ int UnifiedDefraggingLayerScheduler::_schedule_impl(std::vector<int>* out_snapsh
     }
     step_end(effective_snapshot_int);
 
+    if (best_layer >= 0) {
+        GapTracedDefragScheduler::selected(this, total_raw);
+    }
     if (out_snapshot) *out_snapshot = std::move(raw_tokens);
     return best_layer;
 }

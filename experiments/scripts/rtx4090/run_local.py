@@ -45,6 +45,30 @@ def parse_configuration(argv=None):
     cli_args = defaults + extra
     parser = cli.get_parser_base()
     args = parser.parse_args(cli_args)
+    gap_rank = os.environ.get("DMOE_GAP_WORKER")
+    if gap_rank is not None:
+        if (gap_rank not in ("0", "1", "2", "3") or not args.nsys
+                or options.mode == "server" or args.synchronized_start or args.paced_decode
+                or args.unified_scheduler_type != "defrag" or args.generator_type != "uniform"
+                or args.checkpoint_path or args.decode_snapshot):
+            wrapper.error("DMOE_GAP_WORKER requires rank 0..3, --nsys and uniform synthetic defrag")
+    shared_trace = os.environ.get("STREAMEP_SHARED_TOP8")
+    if shared_trace:
+        if (options.mode == "server" or args.generator_type != "uniform"
+                or args.synchronized_start or args.checkpoint_path or args.decode_snapshot
+                or args.gate_profile_file or os.environ.get("DMOE_WEIGHTED_ROUTER_FILE")):
+            wrapper.error("Shared Top-8 replay requires the uniform synthetic benchmark")
+        if args.max_input_len != args.min_input_len + 1:
+            wrapper.error("Shared Top-8 replay requires a fixed prompt length")
+        import numpy as np
+        try:
+            trace = np.load(shared_trace, mmap_mode="r", allow_pickle=False)
+        except (OSError, ValueError) as exc:
+            wrapper.error(f"Cannot load STREAMEP_SHARED_TOP8: {exc}")
+        if (trace.dtype != np.uint8 or trace.ndim != 4 or trace.shape[3] != 8
+                or trace.shape[0] < args.num_requests or trace.shape[1] < args.max_output_len - 1
+                or trace.shape[2] < args.num_layers):
+            wrapper.error("Shared Top-8 requires uint8 [requests, steps, layers, 8] covering this run")
     if args.checkpoint_path and args.decode_snapshot:
         if options.mode != "benchmark":
             wrapper.error("Real Qwen decode uses benchmark mode")
@@ -186,6 +210,10 @@ def main(argv=None):
     if options.dry_run:
         print("CLI validation passed; no GPU, Ray cluster, download, or file write was performed.")
         return
+    if path := os.environ.get("STREAMEP_SHARED_TOP8"):
+        os.environ["STREAMEP_SHARED_TOP8"] = str(Path(path).resolve())
+        os.environ["STREAMEP_SHARED_TOP8_PROMPT_LEN"] = str(args.min_input_len)
+        print(f"Shared Top-8 replay: {os.environ['STREAMEP_SHARED_TOP8']}", flush=True)
     if args.nsys:
         if shutil.which("nsys") is None:
             raise RuntimeError("Install Nsight Systems CLI and put nsys on PATH; see docs/rtx4090-profiling.md")
@@ -251,7 +279,7 @@ def main(argv=None):
                 from disagmoe.utils.nsys_profile import collect_nsight_reports, make_nsight_config
                 profile_dir = Path(os.environ.get(
                     "DMOE_PROFILE_OUTPUT_DIR", str(Path(args.file).with_suffix(".nsys")))).resolve()
-                reports = collect_nsight_reports(ray_dir, profile_dir)
+                reports = collect_nsight_reports(ray_dir, profile_dir, expected_workers=len(master.nsys_workers))
                 manifest = {
                     "workload": "synthetic decode with random weights and routing",
                     "configuration": vars(args), "ray_directory": ray_dir,
@@ -262,6 +290,11 @@ def main(argv=None):
                     "coverage": "GPU Engine actors; driver/tokenizer/detokenizer CPU not captured",
                     "capture_window": "after warmup until all benchmark responses arrive",
                 }
+                if gap_rank := os.environ.get("DMOE_GAP_WORKER"):
+                    manifest["gap_worker"] = int(gap_rank)
+                    manifest["coverage"] = f"GPU Engine actor on logical rank {gap_rank}; other ranks unprofiled"
+                    if os.environ.get("STREAMEP_SHARED_TOP8"):
+                        manifest["workload"] = "synthetic decode with random weights and shared Top-8 routing"
                 if args.synchronized_start:
                     manifest["workload"] = master.synchronized_start_report["workload"]
                     manifest["capture_window"] = (

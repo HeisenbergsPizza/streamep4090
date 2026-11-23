@@ -5,8 +5,8 @@
 set -eo pipefail
 
 mode="${1:-run}"
-if [[ $# -gt 1 || ( "$mode" != run && "$mode" != --check-only ) ]]; then
-  echo "Usage: bash $0 [--check-only]" >&2
+if [[ $# -gt 1 || ( "$mode" != run && "$mode" != serve && "$mode" != serve-decode-dummy && "$mode" != --check-only ) ]]; then
+  echo "Usage: bash $0 [run|serve|serve-decode-dummy|--check-only]" >&2
   exit 2
 fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,20 +41,39 @@ server_args=(
   --chunked-prefill-size 2048
   # Global request limit; the per-DP limit and graph width are 128.
   --max-running-requests 512 --cuda-graph-max-bs 128
-  --enable-layerwise-nvtx-marker
 )
+if [[ "$mode" == serve* ]]; then
+  export NCCL_IB_DISABLE=1 NCCL_SHM_DISABLE=0 NCCL_CUMEM_HOST_ENABLE=0
+  export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+  server_args+=(--disable-radix-cache)
+else
+  server_args+=(--enable-layerwise-nvtx-marker)
+fi
+if [[ "$mode" == serve-decode-dummy ]]; then
+  server_args+=(--disaggregation-mode decode --disaggregation-transfer-backend fake --load-format dummy)
+fi
+if [[ -n "${STREAMEP_SHARED_TOP8:-}" ]]; then
+  if [[ "$mode" != serve-decode-dummy || ! -r "$STREAMEP_SHARED_TOP8" ]]; then
+    echo "STREAMEP_SHARED_TOP8 requires serve-decode-dummy and a readable .npy trace" >&2
+    exit 2
+  fi
+  export STREAMEP_SHARED_TOP8="$(realpath "$STREAMEP_SHARED_TOP8")"
+  export SGLANG_EXTERNAL_MODEL_PACKAGE=shared_route_models
+  export PYTHONPATH="$script_dir${PYTHONPATH:+:$PYTHONPATH}"
+fi
 if [[ "$SGLANG_DISABLE_CUDA_GRAPH" == 1 ]]; then
   server_args+=(--disable-cuda-graph)
 fi
 
 check_config() {
-  python -B - "${server_args[@]}" <<'PY'
+  python -B - "$mode" "${server_args[@]}" <<'PY'
 import json
 import os
 import sys
 from sglang.srt.server_args import prepare_server_args
 
-args = prepare_server_args(sys.argv[1:])
+mode = sys.argv[1]
+args = prepare_server_args(sys.argv[2:])
 args.check_server_args()
 expected = {
     "tp_size": 4, "dp_size": 4, "ep_size": 4, "moe_dp_size": 1,
@@ -65,6 +84,9 @@ expected = {
     "moe_a2a_backend": "none", "moe_runner_backend": "triton",
     "load_balance_method": "round_robin", "chunked_prefill_size": 512,
 }
+if mode == "serve-decode-dummy":
+    expected.update(disaggregation_mode="decode", disaggregation_transfer_backend="fake",
+                    load_format="dummy", disable_radix_cache=True)
 for key, value in expected.items():
     actual = getattr(args, key)
     if actual != value:
@@ -85,7 +107,9 @@ if [[ "$mode" == --check-only ]]; then
   exit 0
 fi
 
-command -v nsys >/dev/null
+if [[ "$mode" == run ]]; then
+  command -v nsys >/dev/null
+fi
 # Refuse to start beside an older service on this port; never stop it here.
 python -B - <<'PY'
 import socket
@@ -94,20 +118,37 @@ with socket.socket() as sock:
     sock.bind(("127.0.0.1", 30000))
 PY
 
-report_dir="$SGLANG_WORK/reports/$(date +%Y%m%d-%H%M%S)-dpa4-ep4-b512-$graph_mode-$$"
+tag="dpa4-ep4-b512-$graph_mode"
+if [[ "$mode" == serve* ]]; then
+  tag="$mode-$tag"
+fi
+report_dir="$SGLANG_WORK/reports/$(date +%Y%m%d-%H%M%S)-$tag-$$"
 mkdir -p "$report_dir"
 check_config > "$report_dir/config-validation.json"
 python -m pip freeze > "$report_dir/pip-freeze.txt"
-nsys --version > "$report_dir/nsys-version.txt"
 cp "$MODEL_DIR/config.json" "$report_dir/model-config.json"
 if [[ -f "$MODEL_DIR/download_revision.txt" ]]; then
   cp "$MODEL_DIR/download_revision.txt" "$report_dir/model-revision.txt"
 fi
 cp "$script_path" "$report_dir/profile_server.sh"
-cp "$script_dir/profile_client_dpa4_ep4_b512.py" "$report_dir/profile_client.py"
 printf '%q ' python -m sglang.launch_server "${server_args[@]}" > "$report_dir/command.txt"
 printf '\n' >> "$report_dir/command.txt"
 echo "本次报告目录：$report_dir"
+if [[ "$mode" == serve* ]]; then
+  if [[ "$mode" == serve-decode-dummy ]]; then
+    echo "合成 decode 使用随机模型权重和占位 KV，每条请求需要 bootstrap_room。"
+  fi
+  if [[ -n "${STREAMEP_SHARED_TOP8:-}" ]]; then
+    # Fail closed if v0.5.9's registry skipped an external module on import.
+    python -c 'from sglang.srt.models.registry import ModelRegistry as r; m, _ = r.resolve_model_cls(["Qwen3MoeForCausalLM"]); assert m.__module__ == "shared_route_models.qwen3_moe", m'
+    sha256sum "$STREAMEP_SHARED_TOP8" | tee "$report_dir/route-table.sha256"
+  fi
+  echo "固定到达率测试服务：http://127.0.0.1:30000"
+  cd "$SGLANG_WORK"
+  exec python -m sglang.launch_server "${server_args[@]}"
+fi
+nsys --version > "$report_dir/nsys-version.txt"
+cp "$script_dir/profile_client_dpa4_ep4_b512.py" "$report_dir/profile_client.py"
 echo "全局请求上限 512；Attention DP4/TP1；Experts EP4/TP1；CUDA Graph: $graph_mode。"
 if [[ "$SGLANG_DISABLE_CUDA_GRAPH" == 0 ]]; then
   echo "每 DP Graph 上限 128。"

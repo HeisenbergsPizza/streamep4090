@@ -2,7 +2,7 @@
 
 这个模式为每个实际执行的非空 Attention/Expert batch 增加 CPU scheduling 和 GPU batch reformation 的暴露开销。目的是做调度策略的敏感性研究；它没有用 4090 实测校准，也没有实现独立 CPU 线程、metadata 搬运资源或真实的 CPU/GPU 流水线。
 
-默认 `--overhead-model none` 保留原有计算成本与执行行为。`paper` 使用论文 CPU Schedule 与假定的 GPU 计算时间比例；`structural` 按实际选择的输入行、连续片段、调度队列和激活字节数计费。新增 `structural` 不改变 `none`、`paper` 的既有行为。三个模式均不是真实硬件性能预测。
+默认 `--overhead-model none` 使用基础计算成本。`paper` 使用论文 CPU Schedule 与假定的 GPU 计算时间比例，`structural` 按输入行、片段、队列和字节数计费。`pipeline` 在异步 worker 中使用同类结构成本，逐批模拟引擎线程、GPU 计算流和通信之间的依赖。各模式的假设与校准范围见下文。
 
 ## paper：论文数据和假设的边界
 
@@ -73,7 +73,7 @@ Top-K join 传递实际返回行的引用。比如同一 buffer 选中行 `[0,1,
 
 Expert 输入只有一个连续片段，且按 expert 输出所需的行顺序仍连续时，走快速路径，GPU reformation 成本为 **0**；CPU 成本仍收取。Attention 始终按 pack/Top-K 聚合计费，没有单片段快速路径。`V` 表示潜在读写量，快速路径仍保留该 workload 描述；实际计费流量见 `batch_overhead_components.executed_traffic_bytes`，此时为 0。该模型不显式模拟地址表传输、padding、缓存或 Top-K 加法指令。
 
-选批后仍按固定隐藏比例计算暴露成本，先执行 CPU 暴露延迟，再执行 GPU 重组与基础计算；GPU busy 不包含 CPU 延迟。调整 `--cpu-schedule-overlap` 或 `--reformation-overlap` 仍是人为假设，不能得到 CPU 饱和或真实流水线的预测。后续若加入每 GPU 一个逻辑 CPU 工作线程、有限准备队列和 GPU 完成依赖，可复用上述原始成本函数；届时应由执行时间线产生隐藏比例，停止对同一工作重复应用固定折扣。
+`structural` 选批后先执行 CPU 暴露延迟，再执行 GPU 重组与基础计算。GPU busy 仅计 GPU 部分。`--cpu-schedule-overlap` 与 `--reformation-overlap` 指定固定隐藏比例。希望从有限流水深度和事件依赖推导重叠时，使用下面的 `pipeline` 模式。
 
 开启 `--schedule-trace-limit` 后，每批 trace 除原有 `batch_overhead` 时间外，新增 `batch_workload` 和 `batch_overhead_components`，保存 `N/F/Q/H/d`、流量、各成本分量及快速路径是否命中，便于解释扫描结果。即使不保留逐批 trace，结果的 `batch_overhead_accounting.by_gpu[].by_stage_workload` 仍累计输入/输出行、片段、队列检查、流量与快速路径批次数；这些是已调度批次的工作量，提前停止时可能包含尚未完成的批次。
 
@@ -91,19 +91,50 @@ python -m simulation.run --synthetic --mode async --policies defrag \
   --schedule-trace-limit 10000 --output-dir /tmp/streamep-overhead-structural
 ```
 
+## pipeline 模式的异步引擎开销
+
+每个 rank 有一个引擎线程和一条 FIFO 计算流。线程从本地 ready 队列选择并保留本批，出队及准备源行地址后提交 gather，随后准备算子参数并提交 Attention 或 Expert。只有本批 gather、参数提交、前一个计算流操作三个前驱都完成，模型计算才能开始。当前批提交后，线程等待上一批完成，执行其 postprocess、发出结果，再选下一批。空队列时也会处理待发布结果。这样最多有上一批和当前批在途。网络仍按消息投递和接收资源独立推进，远端分支收到后才能入队，最后一个 Top‑K 分支返回后才释放下一层 Attention。
+
+| 可校准项 | 含义 |
+| --- | --- |
+| `--cpu-fixed-us`、`--cpu-per-queue-us`、`--cpu-per-row-us`、`--cpu-per-fragment-us` | 从保留本批到提交 gather 的引擎服务。使用结构模式的 N、F、Q 系数及 `--cpu-schedule-scale`。选层和元数据准备共用这个线程。 |
+| `--cpu-gather-tail-us`、`--cpu-reduce-tail-us` | 普通 gather 或 Top‑K gather-and-sum 提交后的引擎服务，单连续块直接复用时取零。 |
+| `--cpu-pre-attention-us`、`--cpu-pre-expert-us`、`--cpu-launch-us` | 每个普通批次的准备与提交，外加 `--cpu-pre-per-row-us` 乘以本批输出行数。 |
+| `--cpu-post-attention-us`、`--cpu-post-expert-us` | 每次退休对应阶段的固定引擎服务，外加 `--cpu-post-per-row-us` 乘以输出行数，结束后才能发布结果。 |
+| `--reformation-fixed-us`、`--reformation-bandwidth-gb-s`、`--reduction-fixed-us`、`--reduction-bandwidth-gb-s` | 分别校准普通 gather 和 gather-and-sum 的设备时间。默认共用结构模式的截距和有效带宽。两者都使用输入输出字节量、片段项及 `--reformation-scale`。 |
+| `--cpu-finalize-us` | Finalize 在引擎当前轮处理，按需执行 Top‑K 汇合和既有 `finalize_per_token_t` GPU 代理。没有设备工作时在 host 发布，零长度 GPU 标记仅表示逻辑完成。 |
+
+新增的 host 阶段默认 0 µs，供单独校准。每个 rank 的实际占用输出在 `host_busy_ticks_by_phase` 和 `gpu_busy_ticks_by_phase`。前者描述模拟引擎服务，不代表实机 OS 的 on-CPU 时间。等待旧批 GPU event 自然推迟主机进度，单独计入 post 系数会重复收费。模型尚未单列锁竞争、空轮询、拷贝引擎争用和通信 kernel 对 SM 的干扰。
+
+**校准 NVTX 与 GPU 重组。** 从同一个 engine 线程的 `Scheduler::dequeue_merge_unified` 出发，找到范围内实际提交 kernel 的 CUDA runtime API，用同进程的 correlation ID 找到设备活动。分别统计提交前、launch API 和返回父范围前的 host 墙钟，以及关联设备 kernel 的 start/end。要估计 host 服务，先辨认同步等待和调度延迟。GPU 侧应按实际 kernel 种类、行数和激活字节拟合。出队范围内可能启动 GPU 工作，也可能在 kernel 结束之后继续执行，不能将其整个 NVTX 长度用作 GPU 成本。性能验证应留出不同 batch、到达率或层的样本，同时核对吞吐和队列/空档分布。
+
+在仓库根目录可运行以下小规模检查。命令中的非零 host 参数只是用于验证流水的假设值。实际的 CUDA kernel、真实权重和四卡通信均不需要启动。
+
+```bash
+python -m simulation.run --mode async --synthetic --policies defrag \
+  --gpus 4 --layers 4 --experts 32 --top-k 8 --requests 32 --output-tokens 4 \
+  --active-request-cap 32 --attention-batch-cap 128 --expert-batch-cap 512 \
+  --initial-context 64 --hidden-dim 2048 --overhead-model pipeline \
+  --cpu-pre-attention-us 8 --cpu-pre-expert-us 4 --cpu-launch-us 2 \
+  --cpu-post-attention-us 4 --cpu-post-expert-us 2 --cpu-reduce-tail-us 2 \
+  --queue-trace --schedule-trace-limit 2500 --output-dir /tmp/streamep-pipeline-check
+```
+
+逐批 `schedule_trace` 中的 `gather_start/end` 与 `compute_start/end` 分别表示实际的 GPU 服务段。两段之间允许有空档，`post_start/end` 与 `output_ready` 在引擎退休时更新。选批时写出的流式队列记录只包含当时确定的信息。已有 `sync` 和 `tbo` 基线使用各自的调度流程，`pipeline` 适用于 `--mode async`。
+
 ## 参数
 
 `simulation.run` 和 `simulation.steady_experiment` 接受相同参数：
 
 | 参数 | 默认 | 作用 |
 | --- | --- | --- |
-| `--overhead-model` | `none` | `none`、`paper` 或 `structural` |
+| `--overhead-model` | `none` | `none`、`paper`、`structural` 或异步 `pipeline` |
 | `--cpu-schedule-scale` | `1` | 非负系数，缩放原始 CPU 成本；`paper` 为 Table 4 Schedule，`structural` 为上述四项之和 |
 | `--cpu-schedule-overlap` | 未指定 | `paper` 默认 Attention 0.506、Expert 0.683；`structural` 默认 0；显式指定时两类统一使用该 `[0,1]` 比例 |
 | `--reformation-compute-ratio` | 未指定 | `paper` 解析为假定的 `0.05`，`none` 为 `0`；显式值必须非负 |
 | `--reformation-overlap` | `0` | GPU reformation 的假定隐藏比例，范围 `[0,1]` |
 
-以下参数仅适用于 `structural`；不显式传入时采用表中假设值：
+`structural` 和 `pipeline` 共用以下结构成本参数。表中默认值属于建模假设，仍需用目标机器的 profile 校准。
 
 | 参数 | 假设初值 | 单位 |
 | --- | ---: | --- |

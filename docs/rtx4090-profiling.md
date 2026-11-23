@@ -352,3 +352,118 @@ SGLANG_DISABLE_CUDA_GRAPH=0 python experiments/scripts/sglang/profile_client_dpa
 对齐的是 **初始 KV 长度 64**，两套系统的 KV 都随 decode 增长。SGLang 仍包含真实 prefill，其第一个输出 token 由 prefill 产生；StreamEP 使用 dummy KV 并执行合成 decode。因此这次改动没有把两者的整个请求执行路径变成同一个工作负载，也没有保证所有请求始终处于同一个 decode batch。分析时选取对应上下文长度的 decode 区间；客户端总耗时仍包含 prefill 和 HTTP。
 
 API 依据：[SGLang v0.5.9 的批量 input_ids 定义](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/managers/io_struct.py#L155-L159)及[直接使用已分词输入的逻辑](https://github.com/sgl-project/sglang/blob/v0.5.9/python/sglang/srt/managers/tokenizer_manager.py#L614-L646)。本地验证使用模拟 tokenizer/HTTP 响应；实际 Qwen tokenizer 和四卡执行需在服务器运行时验证。
+
+### 7.1 SGLang 等间隔到达的端到端吞吐
+
+与第 3.2 节的 StreamInfer 合成负载对照时，固定全局到达率、输入输出长度和正式投放时长。下面复现 12 req/s、1,536 个请求的配置。以第一个请求的计划提交时刻为零点，此后每 83.33 ms 单独提交一条请求，完成速度不控制后续到达。客户端在开始计时前准备好 1,536 条带不同编号的 64-token 输入，并以 10 条请求预热。正式请求做 greedy 生成，忽略 EOS，逐条检查服务端返回的输入长度和 128 个输出 token。
+
+终端一在仓库内启动普通服务。沿用四卡 BF16、Attention DP4、Expert EP4、CUDA Graph 及全局在跑上限 512。此模式关闭跨请求前缀缓存。
+
+```bash
+cd "$HOME/guest0/projects/Qwen3/streamep4090"
+SGLANG_DISABLE_CUDA_GRAPH=0 bash experiments/scripts/sglang/profile_server_dpa4_ep4_b512.sh serve
+```
+
+终端二等待服务就绪后运行客户端。
+
+```bash
+source /workspace/zzc/sglang-qwen30b/activate.sh
+cd "$HOME/guest0/projects/Qwen3/streamep4090"
+OUT="$SGLANG_WORK/reports/uniform-$(date +%Y%m%d-%H%M%S)-$$"
+mkdir -p "$OUT"
+SGLANG_DISABLE_CUDA_GRAPH=0 python experiments/scripts/sglang/bench_uniform.py \
+  --rate 12 --num-requests 1536 --window 95,125 --output "$OUT/rate-12.json"
+```
+
+`window` 统计半开区间内收到结束响应的请求数、流式响应中新收到的输出 token 数、两端的未完成请求数。`arrivals_in_window` 则统计在窗口内提交的请求，等这些请求全部结束后再算其延迟，包含跨越窗口右边界的请求。`all_requests.e2e_ms` 包含从发起 HTTP 请求到收到 SSE 结束标志的时间。`whole` 的分母包含最后一次到达后的排空时间。对照 StreamInfer 时，使用相同正式起点、相同窗口的 Finalize 计数，及 driver 的提交、完成记录。SGLang 的 token 在客户端收包时计数，StreamInfer 的 token 在 worker 从 Finalize 队列取出时计数。
+
+扫整数到达率可保持约 128 秒的投放时长，例如设 `RATE=16`，将上面命令改为 `--rate "$RATE" --num-requests "$((128 * RATE))" --window 95,125` 并更换输出文件名。先看每个速率的 5 秒分箱和积压变化再选择稳态区间。
+
+SGLang 测量输入共用一个模板，每条有不同编号。这套真实服务包含 prefill、真实 gate 和 LM head、HTTP 流式返回。StreamInfer 合成实验从指定上下文长度开始，用合成权重和路由。SGLang 的全局在跑请求上限 512 与 StreamInfer 的单次 Expert 出队上限 512 约束不同，实际并发和 batch 由各系统自行形成。两组数据适合描述相同到达负载下的系统表现，调度策略的单独收益仍需算子和工作负载一致的对照实验。
+
+### 7.2 SGLang 只跑合成 decode
+
+在终端一运行下面的服务。它从本地 Qwen 配置构建模型并初始化 dummy 权重，使用 SGLang 的 fake KV 传输后端接收请求，跳过 prompt prefill。
+
+```bash
+cd "$HOME/guest0/projects/Qwen3/streamep4090"
+SGLANG_DISABLE_CUDA_GRAPH=0 bash experiments/scripts/sglang/profile_server_dpa4_ep4_b512.sh serve-decode-dummy
+```
+
+终端二运行相同的等间隔负载。
+
+```bash
+source /workspace/zzc/sglang-qwen30b/activate.sh
+cd "$HOME/guest0/projects/Qwen3/streamep4090"
+OUT=$(mktemp -d "$SGLANG_WORK/reports/decode-dummy-XXXXXX")
+SGLANG_DISABLE_CUDA_GRAPH=0 python experiments/scripts/sglang/bench_uniform.py \
+  --decode-dummy --rate 12 --num-requests 1536 --window 95,125 --output "$OUT/result.json"
+```
+
+每条请求携带 64 个输入 token 和独立的 `bootstrap_room`。fake 后端返回一个占位首 token，客户端请求 129 个 API 输出，跳过首个后用余下的 128 个 decode 输出算吞吐、首 token 延迟和 token 间隔。请求延迟从提交一直计到响应结束。全程预期收到 198,144 个 API 输出，其中 196,608 个计入正式 decode。默认由 SGLang 的 dummy 模型自行选专家。
+
+### 7.3 两个框架回放同一份 Top‑8
+
+在仓库根目录创建一次路由表，两个服务端都使用它的绝对路径。
+
+```bash
+OUT=$(mktemp -d /workspace/zzc/streamep4090/reports/shared-top8-XXXXXX)
+mkdir -p "$OUT/streaminfer" "$OUT/sglang"
+export STREAMEP_SHARED_TOP8="$OUT/uniform.npy"
+python experiments/scripts/ops/shared_top8.py prepare --output "$STREAMEP_SHARED_TOP8" \
+  --requests 1536 --steps 128 --layers 48 --experts 128 --seed 0
+```
+
+每个表项按正式请求序号、从 0 开始的 decode 步和层号索引，包含从 128 个专家中均匀无放回抽取的 8 个有序 ID，两边权重均为 1/8。真实模型的路由热度可以与这张表有很大差别。
+
+在 StreamInfer 环境运行以下正式负载。
+
+```bash
+sha256sum "$STREAMEP_SHARED_TOP8" > "$OUT/streaminfer/route-table.sha256"
+DMOE_RAY_TMPDIR=/workspace/zzc/ray RUN_TIMEOUT_SECONDS=1800 \
+  bash experiments/scripts/rtx4090/launch.sh benchmark \
+  --generator-type uniform --rate 12 --num-requests 1536 \
+  --min-input-len 64 --max-input-len 65 --min-output-len 128 --max-output-len 129 \
+  --unified-scheduler-type defrag --max-batch-size-attn 128 --max-attn-graph-bsz 128 \
+  --max-batch-size-expert 512 --cuda-graph-attn --cuda-graph-expert --gpu-usage 0.80 \
+  --scheduler-choices-dir "$OUT/streaminfer/choices" --analyze-throughput \
+  --analyze-throughput-window 95,125 --file "$OUT/streaminfer/metrics.csv"
+```
+
+释放四卡后运行第 7.2 节的 SGLang 服务，在服务端 shell 中保留 `STREAMEP_SHARED_TOP8` 并把同一文件的 `sha256sum` 写入 `"$OUT/sglang/route-table.sha256"`。客户端运行第 7.2 节的 `bench_uniform.py --decode-dummy` 命令，将输出设为 `"$OUT/sglang/result.json"`。新终端中的 `OUT` 要指向上面创建的同一目录。
+
+可以单独开短实验验证路由。在 StreamInfer 启动进程设置 `STREAMEP_SHARED_TOP8_AUDIT_DIR="$OUT/si-audit"`，将请求数设为 4、输出长度设为 4（参数 `4,5`），去掉吞吐窗口限定，使用独立的输出路径。SGLang 小实验在服务端设置 `STREAMEP_ROUTE_AUDIT_DIR="$OUT/sg-audit"` 后启动，客户端用 `--decode-dummy --num-requests 4 --rate 4`。两边各核对前 4 步每层实际选择的专家。正式实验重新启动服务，清除两个 audit 环境变量。
+
+```bash
+python experiments/scripts/ops/shared_top8.py verify --trace "$STREAMEP_SHARED_TOP8" \
+  --requests 4 --steps 4 --layers 48 \
+  --streaminfer "$OUT"/si-audit/*.jsonl --sglang "$OUT"/sg-audit/*.jsonl > "$OUT/verified.json"
+python experiments/scripts/ops/compare_shared_top8.py \
+  --streaminfer "$OUT/streaminfer" --sglang "$OUT/sglang/result.json" \
+  --verification "$OUT/verified.json" --window 95,125 --output "$OUT/comparison.json"
+```
+
+### 8. 单 worker 的 GPU 空档与就绪队列
+
+此模式用于单节点四卡的统一 defrag、等间隔到达、合成 decode。先用包含 `csrc/muhelper/worker_gap_trace.hpp` 的源码构建 `disagmoe_c`。四个 worker 都执行模型，只有 `DMOE_GAP_WORKER` 指定的逻辑 rank 采集 Nsight。实验复用现有 CUDA event，CPU 采样保持关闭。
+
+在 StreamInfer 环境中，设 `STREAMEP_SHARED_TOP8` 为第 7.3 节的路由表绝对路径。下面使用一个新目录。
+
+```bash
+OUT=$(mktemp -d /workspace/zzc/streamep4090/reports/worker-gap-XXXXXX)
+export DMOE_GAP_WORKER=0 DMOE_RAY_TMPDIR=/workspace/zzc/ray RUN_TIMEOUT_SECONDS=1800
+PROFILE_RUN_DIR="$OUT/formal" bash experiments/scripts/rtx4090/profile.sh trace \
+  --generator-type uniform --rate 12 --num-requests 1536 \
+  --min-input-len 64 --max-input-len 65 --min-output-len 128 --max-output-len 129 \
+  --unified-scheduler-type defrag --max-batch-size-attn 128 --max-attn-graph-bsz 128 \
+  --max-batch-size-expert 512 --cuda-graph-attn --cuda-graph-expert --gpu-usage 0.80 \
+  --scheduler-choices-dir "$OUT/formal/choices"
+
+nsys export --type sqlite --output "$OUT/worker.sqlite" "$OUT"/formal/nsight/*.nsys-rep
+python experiments/scripts/rtx4090/analyze_worker_gaps.py --sqlite "$OUT/worker.sqlite" \
+  --choices "$OUT/formal/choices/run.json" --window 95,125 --output "$OUT/gaps.json"
+```
+
+窗口起点取正式请求开始投放的时刻，通过 worker 的单调时钟标记换算到 Nsight 时间轴。`idle_ns` 对全部已记录 CUDA 流取并集，再计算窗口内没有 kernel、显存拷贝或 memset 的时长。NCCL kernel 计入 GPU 活动。
+
+`idle_partition_ns` 交叉统计本地就绪队列状态和已选批次状态。`queue_empty_without_observed_claim_ns` 表示队列全空且没有观察到待执行批次的空档；观察到 CPU 已提交但尚未确认 event 完成的时间另计。合成 Finalize 的异步工作也单列保守处理。唤醒来源标出哪个入队事件结束了队列全空，例如收齐一个 Top‑8 或收到新 Expert 工作。仅据此不能判断之前是哪个 GPU 或哪条通信链路拖慢了该分支。

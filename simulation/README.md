@@ -7,6 +7,8 @@ python -m pip install -r simulation/requirements.txt
 python -m simulation.run --help
 ```
 
+要在目标 PCIe/NVLink 单节点采集 Expert、decode Attention、重组、通信和引擎 CPU 开销，见[硬件采集工具](profiling/README.md)。`simulation.run` 和 `simulation.steady_experiment` 都可通过 `--profile-bundle` 读取采集目录。
+
 ## 后续研究实验的配置约束
 
 从2026-10-10起，研究实验以真实推理系统的代码/启动脚本为配置基准。每次明确目标模型、部署拓扑、DP/EP/TP、batch上限、调度参数、准入/工作负载与成本来源，并保存参考路径及hash。除明确研究的变量外，不为缩短仿真或改变结果自行缩小batch上限。参数扫描、消融和测试配置应单独标注。
@@ -184,6 +186,7 @@ python -m simulation.steady_experiment \
 
 - 可选 `--overhead-model paper` 增加论文 Table 4 的 CPU **Schedule** 暴露开销，以及假定为基础计算时间 5% 的 GPU reformation；默认 `none` 保留原行为。CPU 默认隐藏比例为 Attention 50.6%、Expert 68.3%，GPU reformation 默认不隐藏。5% 是可覆盖的假设，不是论文 Figure 17 的 4.5% 吞吐增益。参数、公式、计费范围、基线边界与敏感性命令见 [OVERHEADS.md](OVERHEADS.md)。
 - 可选 `--overhead-model structural` 按批次结构建模：CPU 初值为 `10 + 0.02×输入行数 + 0.1×片段数 + 0.05×队列槽数` us；GPU 重组初值为 `3 + 读写字节数/(500×1000) + 0.05×片段数` us，分别可用 `--cpu-schedule-scale` 与 `--reformation-scale` 缩放。各系数均为可调假设，500 的单位为 **GB/s**，没有硬件校准。片段是 logical buffer 中所选行的连续区间；Expert 单连续输入且顺序兼容时免 GPU 重组，Attention 仍 pack/聚合。两种隐藏比例默认均为 0，仍使用固定比例抽象，没有独立 CPU 资源或 CPU/GPU 流水线。支持 `simulation.run --mode async` 与 steady 的 async/sync/TBO；旧 `simulation.run --mode sync|tbo` 和 legacy 入口拒绝此模式。开启 `--schedule-trace-limit` 可查看逐批工作量与成本分项；完整定义、参数及合成命令见 [OVERHEADS.md](OVERHEADS.md#structural按批次结构计费)。
+- 异步引擎可用 `--overhead-model pipeline` 模拟每 rank 的 CPU 引擎线程、FIFO GPU 计算流以及有限的提前选批。普通 gather 和 Top‑K 归约可分别校准。输出保留 GPU 重组与计算之间的空档，CPU/GPU 重叠由事件时刻决定。[参数和运行命令](OVERHEADS.md#pipeline-模式的异步引擎开销)
 - 单节点逻辑 GPU；每 GPU 共置 Attention 和所分配的专家，一次只执行一个不可抢占计算批次。专家按连续 ID 均分，Attention 请求 home GPU 轮转分配。
 - async 的流水线为 `A0,E0,…,A(L-1),E(L-1),A_L`；各 Top-k 分支异步回传，全部到达后进入下一 Attention 队列。终端 `A_L` 参与调度，`--finalize-per-token-us` 默认 0，表示终端计算成本未计入。
 - defrag 对专家副本数除以 Top-k，与 Attention token 数统一比较。得分包含当前量与衰减的后续流水线当前/历史负载；默认 lookahead 4、lookback 4、decay 0.8。lookahead 1 只看当前量，lookback 0 不保留历史。history 在每次成功调度后记录整个 GPU 快照，专家有效量按整数截断；同分按统一索引先全部 A 再全部 E。

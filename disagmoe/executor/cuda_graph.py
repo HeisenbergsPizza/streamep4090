@@ -31,8 +31,7 @@ class CUDAGraphAttnExecutor:
         self.cache_config = cache_config
         self.attn_executor = attn_executor
         self.fused_copy = True
-        self.has_profile_gating = getattr(attn_executor, 'gate_profile_bytes', None) is not None \
-            and len(attn_executor.gate_profile_bytes) > 0
+        self.has_profile_gating = attn_executor.has_profile_gating
         
     def create_cuda_graph_buffers(self):
         assert get_global_engine_config().enable_cuda_graph_attn
@@ -127,7 +126,7 @@ class CUDAGraphAttnExecutor:
             free_memory_before, _ = torch.cuda.mem_get_info()
             if self.has_profile_gating:
                 self.static_request_ids[ : graph_batch_size].copy_(
-                    torch.arange(graph_batch_size, dtype=torch.int64, device="cuda")
+                    self.attn_executor.dummy_routing_inputs(graph_batch_size)
                 )
             for layer_id in self.model_config.layer_ids:
                 graph = graph_list[layer_id]
@@ -175,7 +174,7 @@ class CUDAGraphAttnExecutor:
             for bs in self.graph_batch_sizes:
                 batch = make_attention_dummy_batch(0, bs, self.model_config.hidden_size, self.model_config.max_seq_len)
                 meta = self.attn_executor.block_mgr.pack_flash_attn_metadata(batch.to_metadata_c(), batch, dummy_cache=True)
-                request_ids = torch.arange(bs, dtype=torch.int64, device="cuda") if self.has_profile_gating else None
+                request_ids = self.attn_executor.dummy_routing_inputs(bs)
                 hiddens, expert_weights, expert_ids = self.run(layer_id, batch.seq_lens_tensor.to(torch.long), batch.data, meta, request_ids=request_ids)
         torch.cuda.synchronize()
 

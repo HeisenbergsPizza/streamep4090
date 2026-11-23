@@ -2,6 +2,7 @@ from disagmoe.frontend.controller import init_controller, Controller, AsyncResul
 from disagmoe.utils.placement import ModelPlacement, ClusterConfig, get_model_placement
 from disagmoe.utils.utils import StepInfo
 from disagmoe.utils.metrics import Metric
+from disagmoe.utils.shared_top8_replay import WARMUP_REQUESTS, WARMUP_PROMPT_LEN
 from disagmoe.utils.constants import *
 from disagmoe.config import (
     ModelConfig,
@@ -600,9 +601,9 @@ async def run_synchronized_benchmark(master: Controller, args, responses):
 
 async def benchmark_warmup(master: Controller, args):
     logger.info("Now running warmup ...")
-    _num_warmup_requests = 10
+    _num_warmup_requests = WARMUP_REQUESTS
     _num_warmup_rate = 5
-    warmup_input = 100
+    warmup_input = WARMUP_PROMPT_LEN
     warmup_output = 50
     await run_benchmark(
         master, args, args.generator_type, _num_warmup_requests, 
